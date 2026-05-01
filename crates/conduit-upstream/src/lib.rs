@@ -175,6 +175,26 @@ pub enum TlsLoadError {
     MismatchedClientCert,
 }
 
+/// Rebuild `original` with scheme `http` and authority pointing at
+/// `addr`, keeping the existing path-and-query. Avoids the
+/// `format!("http://{addr}{path}")` + `.parse()` round-trip the
+/// previous implementation did per request.
+///
+/// `Authority::from_maybe_shared` parses but doesn't reallocate
+/// the `addr.to_string()` buffer (it stores it as `Bytes`), so the
+/// only allocation here is the addr's stringification — same as
+/// before, but without the path-and-query copy.
+fn rewrite_uri(original: &http::Uri, addr: std::net::SocketAddr) -> Result<http::Uri, http::Error> {
+    let mut parts = original.clone().into_parts();
+    parts.scheme = Some(http::uri::Scheme::HTTP);
+    let authority_bytes = bytes::Bytes::from(addr.to_string());
+    parts.authority = Some(http::uri::Authority::from_maybe_shared(authority_bytes)?);
+    if parts.path_and_query.is_none() {
+        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+    }
+    Ok(http::Uri::from_parts(parts)?)
+}
+
 pub(crate) fn build_https_connector(
     http: hyper_util::client::legacy::connect::HttpConnector,
     tls: Option<UpstreamTlsOptions>,
@@ -526,20 +546,12 @@ impl Upstream {
         } else {
             match self.pick_addr() {
                 Some((addr, idx)) => {
-                    let path_and_query = parts
-                        .uri
-                        .path_and_query()
-                        .map_or("/", http::uri::PathAndQuery::as_str)
-                        .to_owned();
-                    let new_uri: http::Uri = format!("http://{addr}{path_and_query}")
-                        .parse()
-                        .map_err(|e: http::uri::InvalidUri| {
-                            ForwardError::Body(Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                e.to_string(),
-                            )))
-                        })?;
-                    parts.uri = new_uri;
+                    parts.uri = rewrite_uri(&parts.uri, addr).map_err(|e| {
+                        ForwardError::Body(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            e.to_string(),
+                        )))
+                    })?;
                     Some(idx)
                 }
                 None => return Err(ForwardError::BreakerOpen),
