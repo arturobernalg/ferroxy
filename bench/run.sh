@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
-# bench/run.sh — repro harness for measuring conduit's plaintext H1
-# throughput on a single box.
+# bench/run.sh — REGRESSION DETECTOR ONLY.
+#
+# This is a single-box loopback harness. The numbers it produces are
+# **not comparable** to nginx, Pingora, or production traffic. They
+# exist so a contributor can spot a regression in conduit's own hot
+# path between commits on the same box.
+#
+# DO NOT publish numbers from this harness as "conduit vs nginx" or
+# similar. TCP over loopback short-circuits real congestion control,
+# the python backend caps throughput long before conduit does, and
+# distro-default sysctls move numbers ±20%. See:
+#   - bench/compare/methodology.md  (the bar a real comparison run
+#     must meet)
+#   - BENCHMARKS.md                 (the published-results contract)
 #
 # Layout:
 #
 #   wrk  --(:8000)-->  conduit  --(:8001)-->  backend (python http.server)
 #
-# Every component runs on loopback. The harness:
+# The harness:
 #   1. builds conduit in release mode (cached on subsequent runs)
 #   2. starts a static-file backend on :8001
 #   3. starts conduit on :8000 with bench/conduit.toml
@@ -19,9 +31,6 @@
 #
 # Override defaults by exporting:
 #   DURATION=30 CONNECTIONS=256 THREADS=4 ./bench/run.sh
-#
-# nginx / Pingora comparison runs are P11.x scope; they need a stable
-# version pin and identical body sizes. See BENCHMARKS.md for plan.
 set -euo pipefail
 
 # Resolve repo root regardless of where the script is invoked from.
@@ -33,6 +42,16 @@ DURATION="${DURATION:-30}"
 CONNECTIONS="${CONNECTIONS:-256}"
 THREADS="${THREADS:-$(nproc 2>/dev/null || echo 4)}"
 LOADGEN="${LOADGEN:-wrk}"
+
+cat <<'BANNER'
+================================================================
+  REGRESSION-ONLY HARNESS — DO NOT PUBLISH AS A COMPARISON
+  Numbers from this run are valid only for spotting regressions
+  in conduit's own hot path on this same box. They are NOT
+  comparable to nginx, Pingora, or production traffic. See
+  bench/compare/methodology.md for the comparison bar.
+================================================================
+BANNER
 
 CONDUIT_PORT=8000
 BACKEND_PORT=8001

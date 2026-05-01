@@ -49,24 +49,51 @@ The numbers from the loopback run are **not** the charter targets —
 they are bounded by the python backend's throughput. Use the run as a
 *regression detector* when changing hot paths.
 
-## Comparison runs (P11.x)
+## Microbenchmarks
 
-Comparing against nginx and Pingora is part of the charter and lives
-in P11.x. The comparison plan:
+Per-component criterion benches live next to their owning crate
+(`crates/<crate>/benches/<name>.rs`) and are indexed in
+[`bench/micro/README.md`](./bench/micro/README.md). A microbench
+number is publishable on its own merits because the methodology is
+bounded — `cargo bench`, release profile, `black_box` on inputs. The
+current set:
 
-- Fix a single body size (4 KB response) and request shape (`GET /static-file`).
-- Use **identical** wrk parameters for all three.
-- Pin versions: nginx = latest stable, Pingora = latest tagged release.
-- Ensure no side-channel I/O (no logging to disk, no proxy_buffering on
-  nginx, no caching).
-- Run on a real NIC, not loopback. Loopback short-circuits TCP and
-  paints a misleading picture of congestion control.
-- Capture: RPS, p50, p95, p99, p99.9, CPU%, RSS, syscalls/req
-  (perf trace).
+- `route_lookup` (conduit-lifecycle): 32–50 ns per lookup at
+  100 hosts × 10 prefixes. Documented baseline lives in
+  [`bench/micro/README.md`](./bench/micro/README.md).
 
-The comparison harness will land in `bench/compare.sh` once a real
-test bench is wired up. We refuse to publish "vs nginx" numbers from
-loopback runs — if you see them in the repo, treat them as a bug.
+When a hot-path change lands, the bench gets rerun and the baseline
+in that file is updated alongside the commit. A regression that
+isn't justified in the commit message is a CI gate failure (charter
+quality-gate item 7).
+
+## Comparison runs
+
+Comparison runs against nginx and Pingora live in
+[`bench/compare/`](./bench/compare/) with a methodology bar so
+strict that the harness refuses to start if it isn't met. The
+methodology is captured in
+[`bench/compare/methodology.md`](./bench/compare/methodology.md).
+Summary:
+
+- Real NIC. **Loopback is forbidden** for comparison runs and the
+  harness refuses `BENCH_NIC=lo`.
+- Kernel ≥ 6.6, sysctls applied via `bench/compare/sysctls.sh`.
+- Pinned versions of nginx, Pingora, conduit, wrk — the SHAs / tags
+  go in the result file.
+- ≥ 60 s per scenario, ≥ 3 repeats (5 recommended), report median +
+  spread.
+- Multi-socket: wrk pinned to a different NUMA node than the
+  proxies.
+- Fixed body shape per scenario (1 KB / 4 KB / 64 KB), one number
+  per shape; never averaged.
+
+We refuse to publish "vs nginx" numbers from loopback runs — if you
+see them in the repo, treat them as a bug. The charter is explicit
+on this; the user has been explicit on this; the harness enforces
+it. Until a real bench box exists, the honest status is
+"architecturally plausible, empirically unproven" — that is a
+**stronger** position than a misleading benchmark.
 
 ## Profiling
 
