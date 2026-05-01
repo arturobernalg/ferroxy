@@ -97,14 +97,8 @@ fn main() -> ExitCode {
         return ExitCode::from(78);
     }
 
-    let workers = resolve_workers(cfg.server.workers);
-    let mut spec = ServeSpec::new(cfg.server.listen_http.clone(), workers);
-    spec.cpu_affinity = cfg.server.cpu_affinity;
-
-    // Build the lifecycle dispatcher from the config. Wrapped in an
-    // ArcSwap so SIGHUP can replace it atomically without taking a
-    // lock on the hot path. Each request loads a snapshot Arc once.
-    let dispatch: DispatchSwap = Arc::new(ArcSwap::new(Arc::new(Dispatch::from_config(&cfg))));
+    let spec = build_serve_spec(&cfg);
+    let dispatch = build_dispatch_swap(&cfg);
 
     let (reload_done, reload_thread) = start_reload(&cli.config, &dispatch);
 
@@ -134,6 +128,8 @@ fn main() -> ExitCode {
         Arc::clone(&metrics),
         upstreams_renderer(&dispatch),
     );
+
+    let (health_cancel, health_thread) = start_health_probes(&cfg, &dispatch);
 
     let server = if cfg.server.listen_http.is_empty() {
         None
@@ -170,6 +166,11 @@ fn main() -> ExitCode {
 
     reload_done.store(true, Ordering::Release);
     let _ = reload_thread.join();
+
+    health_cancel.store(true, Ordering::Release);
+    if let Some(h) = health_thread {
+        let _ = h.join();
+    }
 
     join_aux_threads(
         &admin_cancel,
@@ -831,6 +832,103 @@ fn run_h3(
             let _ = t.await;
         }
     });
+}
+
+/// Build the I/O serve spec from the config.
+fn build_serve_spec(cfg: &conduit_config::Config) -> ServeSpec {
+    let workers = resolve_workers(cfg.server.workers);
+    let mut spec = ServeSpec::new(cfg.server.listen_http.clone(), workers);
+    spec.cpu_affinity = cfg.server.cpu_affinity;
+    spec
+}
+
+/// Build the lifecycle dispatcher from the config, wrapped in an
+/// `ArcSwap` so SIGHUP can replace it atomically without taking a
+/// lock on the hot path. Each request loads a snapshot `Arc` once.
+fn build_dispatch_swap(cfg: &conduit_config::Config) -> DispatchSwap {
+    Arc::new(ArcSwap::new(Arc::new(Dispatch::from_config(cfg))))
+}
+
+/// Active health checks. Spawn a dedicated thread + tokio runtime so
+/// probe latency does not bleed into the data plane (same pattern as
+/// the admin server). Probes update the same per-addr breakers the
+/// request hot path consults — a backend that fails probes goes Open
+/// and is rotated out without waiting for real traffic to discover
+/// it. Returns the cancel flag (flipped on shutdown) and the optional
+/// join handle (`None` if no upstream has health checks configured).
+fn start_health_probes(
+    cfg: &conduit_config::Config,
+    dispatch: &DispatchSwap,
+) -> (Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let handle = spawn_health_thread(cfg, dispatch, &cancel);
+    (cancel, handle)
+}
+
+/// Spawn a dedicated thread + tokio runtime that drives active
+/// health probes for every upstream with `[upstream.health_check]`
+/// configured. Returns `None` if no upstream has health checks
+/// configured (no thread is spawned in that case).
+fn spawn_health_thread(
+    cfg: &conduit_config::Config,
+    dispatch: &DispatchSwap,
+    cancel: &Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    // Pair each (upstream-name, probe-config) with the live Upstream
+    // we'd build a Probe for. Doing this on the calling thread (sync,
+    // before the thread spawn) keeps the prober task self-contained
+    // — it doesn't need to reach into the ArcSwap on every iteration.
+    let snapshot = dispatch.load_full();
+    let probes: Vec<conduit_upstream::Probe> = cfg
+        .upstreams
+        .iter()
+        .filter_map(|u| {
+            let hc = u.health_check.as_ref()?;
+            let upstream = snapshot.upstreams().get(&u.name)?;
+            Some(conduit_upstream::Probe::new(
+                upstream.addrs_arc(),
+                upstream.breakers_arc(),
+                conduit_upstream::ProbeConfig {
+                    path: hc.path.clone(),
+                    interval: hc.interval.into(),
+                    timeout: hc.timeout.into(),
+                    unhealthy_threshold: hc.unhealthy_threshold,
+                    healthy_threshold: hc.healthy_threshold,
+                },
+            ))
+        })
+        .collect();
+    if probes.is_empty() {
+        return None;
+    }
+    let cancel_clone = Arc::clone(cancel);
+    Some(
+        std::thread::Builder::new()
+            .name("conduit-health-rt".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to build health-check runtime");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    let mut tasks = Vec::with_capacity(probes.len());
+                    for probe in probes {
+                        let cancel = Arc::clone(&cancel_clone);
+                        tasks.push(tokio::spawn(async move { probe.run(cancel).await }));
+                    }
+                    for t in tasks {
+                        let _ = t.await;
+                    }
+                });
+            })
+            .expect("spawn health thread"),
+    )
 }
 
 /// Build a renderer thunk that walks the live `Dispatch` (loaded from

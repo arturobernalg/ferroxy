@@ -28,9 +28,11 @@
 #![deny(missing_docs)]
 
 mod breaker;
+mod health;
 mod retry;
 
 pub use breaker::{Breaker, BreakerConfig, BreakerState, Decision as BreakerDecision};
+pub use health::{Probe, ProbeConfig};
 pub use retry::{RetryDecision, RetryPolicy};
 
 use std::time::Duration;
@@ -207,6 +209,20 @@ impl Upstream {
     /// Backend addresses (read-only).
     pub fn addrs(&self) -> &[std::net::SocketAddr] {
         &self.addrs
+    }
+
+    /// Cheaply-cloneable handle to the address array. Used by the
+    /// probe builder to share the same backing storage as the hot
+    /// path; `Arc<[T]>::clone` is one refcount bump.
+    pub fn addrs_arc(&self) -> std::sync::Arc<[std::net::SocketAddr]> {
+        std::sync::Arc::clone(&self.addrs)
+    }
+
+    /// Cheaply-cloneable handle to the per-addr breaker array. Used
+    /// by the probe builder so probe outcomes update the same
+    /// breakers the request hot path consults.
+    pub fn breakers_arc(&self) -> std::sync::Arc<[Breaker]> {
+        std::sync::Arc::clone(&self.breakers)
     }
 
     /// Aggregate breaker state across every backend address.
