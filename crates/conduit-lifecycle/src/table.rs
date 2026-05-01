@@ -56,6 +56,11 @@ impl Route {
     /// Test whether `headers` satisfies every entry in this route's
     /// `header_matches`. A route with no header predicates always
     /// matches; otherwise every name+value pair must be present.
+    ///
+    /// `#[inline]` so the call from `HostBucket::find` becomes a
+    /// straight-line check on the empty-predicate fast path even
+    /// without fat-LTO.
+    #[inline]
     fn headers_match(&self, headers: &http::HeaderMap) -> bool {
         for (name, want) in &self.header_matches {
             match headers.get(name) {
@@ -186,6 +191,7 @@ impl HostBucket {
             .sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
     }
 
+    #[inline]
     fn find(&self, path: &str, headers: &http::HeaderMap) -> Option<&Route> {
         if let Some(slot) = self.by_exact.get(path) {
             if let Some(r) = slot.iter().find(|r| r.headers_match(headers)) {
@@ -278,6 +284,7 @@ impl RouteTable {
     /// the host when the input is already all-ASCII-lowercase (the
     /// common case for properly-configured clients). Mixed-case hosts
     /// fall back to a one-shot allocation; this is rare in practice.
+    #[inline]
     fn lookup_bucket(&self, host: &str) -> Option<&HostBucket> {
         if host.bytes().all(|b| !b.is_ascii_uppercase()) {
             return self.by_host.get(host);
