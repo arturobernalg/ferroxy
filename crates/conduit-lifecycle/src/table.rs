@@ -292,10 +292,13 @@ impl RouteTable {
     }
 }
 
-/// Upstreams indexed by name.
+/// Upstreams indexed by name. Stored behind `Arc` so the hot-path
+/// `Dispatch::handle` clones a refcount bump instead of the full
+/// `Upstream` struct (the previous shape cloned the
+/// `RetryPolicy`'s `Vec<u16> on_status` per request).
 #[derive(Clone, Default)]
 pub struct UpstreamMap {
-    by_name: HashMap<String, Upstream>,
+    by_name: HashMap<String, Arc<Upstream>>,
 }
 
 impl std::fmt::Debug for UpstreamMap {
@@ -313,20 +316,22 @@ impl UpstreamMap {
         Self::default()
     }
 
-    /// Register an upstream under `name`. Returns the previous binding
-    /// if one existed.
-    pub fn insert(&mut self, name: impl Into<String>, upstream: Upstream) -> Option<Upstream> {
-        self.by_name.insert(name.into(), upstream)
+    /// Register an upstream under `name`. The upstream is wrapped
+    /// in `Arc` so subsequent clones are refcount bumps.
+    /// Returns the previous binding if one existed.
+    pub fn insert(&mut self, name: impl Into<String>, upstream: Upstream) -> Option<Arc<Upstream>> {
+        self.by_name.insert(name.into(), Arc::new(upstream))
     }
 
     /// Iterate `(name, upstream)` pairs in arbitrary order. Used by
     /// the admin server to render the live pool stats endpoint.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Upstream)> {
-        self.by_name.iter().map(|(k, v)| (k.as_str(), v))
+        self.by_name.iter().map(|(k, v)| (k.as_str(), v.as_ref()))
     }
 
-    /// Look up an upstream by name. Cheap (`HashMap` get).
-    pub fn get(&self, name: &str) -> Option<&Upstream> {
+    /// Look up an upstream by name. Returns the shared `Arc` so the
+    /// caller can clone it cheaply (refcount bump, not a deep copy).
+    pub fn get(&self, name: &str) -> Option<&Arc<Upstream>> {
         self.by_name.get(name)
     }
 
