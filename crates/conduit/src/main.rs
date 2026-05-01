@@ -885,7 +885,21 @@ fn spawn_health_thread(
         .filter_map(|u| {
             let hc = u.health_check.as_ref()?;
             let upstream = snapshot.upstreams().get(&u.name)?;
-            Some(conduit_upstream::Probe::new(
+            // Probe over HTTPS when the upstream itself is configured
+            // for TLS — same CA bundle, same mTLS client cert, same
+            // verify policy. This way a TLS-only backend that is
+            // reachable from the data plane is also reachable from
+            // the prober.
+            let probe_tls = u
+                .tls
+                .as_ref()
+                .map(|t| conduit_upstream::UpstreamTlsOptions {
+                    ca: t.ca.clone(),
+                    client_cert: t.client_cert.clone(),
+                    client_key: t.client_key.clone(),
+                    verify: t.verify,
+                });
+            match conduit_upstream::Probe::new(
                 upstream.addrs_arc(),
                 upstream.breakers_arc(),
                 conduit_upstream::ProbeConfig {
@@ -894,8 +908,19 @@ fn spawn_health_thread(
                     timeout: hc.timeout.into(),
                     unhealthy_threshold: hc.unhealthy_threshold,
                     healthy_threshold: hc.healthy_threshold,
+                    tls: probe_tls,
                 },
-            ))
+            ) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::error!(
+                        upstream = %u.name,
+                        error = %e,
+                        "could not build active probe (TLS load failure); skipping",
+                    );
+                    None
+                }
+            }
         })
         .collect();
     if probes.is_empty() {

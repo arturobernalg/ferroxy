@@ -40,7 +40,23 @@ pub struct ProbeConfig {
     /// half-open success. Surface area for stricter policy when we
     /// add it.
     pub healthy_threshold: u32,
+    /// TLS options for HTTPS probes. `None` → plain HTTP probes
+    /// (the default; matches a backend that speaks plain HTTP).
+    /// `Some(_)` → HTTPS probes using the same TLS knobs the
+    /// production upstream uses (custom CA, mTLS, verify toggle).
+    /// The probe shares those knobs so a TLS-only backend that is
+    /// reachable from the data plane is also reachable from the
+    /// prober.
+    pub tls: Option<crate::UpstreamTlsOptions>,
 }
+
+/// Probe Client type. Same connector shape as `crate::Connector` so
+/// HTTPS probes share the upstream's TLS plumbing (custom CA, mTLS,
+/// verify toggle) while HTTP probes still work without TLS.
+type ProbeClient = Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    Empty<Bytes>,
+>;
 
 /// One configured active probe for one upstream pool.
 ///
@@ -52,7 +68,11 @@ pub struct Probe {
     addrs: Arc<[SocketAddr]>,
     breakers: Arc<[Breaker]>,
     cfg: ProbeConfig,
-    client: Client<hyper_util::client::legacy::connect::HttpConnector, Empty<Bytes>>,
+    client: ProbeClient,
+    /// The scheme the probe uses for its URL (`http` or `https`).
+    /// Captured at construction so each probe iteration doesn't
+    /// re-decide; flips with `cfg.tls.is_some()`.
+    scheme: &'static str,
 }
 
 impl std::fmt::Debug for Probe {
@@ -69,16 +89,28 @@ impl Probe {
     /// Build a probe sharing the supplied `addrs` and `breakers`
     /// arrays with an `Upstream` (so probe outcomes update the same
     /// breakers the request hot path consults).
-    pub fn new(addrs: Arc<[SocketAddr]>, breakers: Arc<[Breaker]>, cfg: ProbeConfig) -> Self {
-        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
-        connector.set_connect_timeout(Some(cfg.timeout));
+    ///
+    /// Returns `Err` only when `cfg.tls` is `Some` and one of the
+    /// configured PEM files (custom CA, client cert, client key)
+    /// can't be loaded. With `cfg.tls = None` this never fails.
+    pub fn new(
+        addrs: Arc<[SocketAddr]>,
+        breakers: Arc<[Breaker]>,
+        cfg: ProbeConfig,
+    ) -> Result<Self, crate::TlsLoadError> {
+        let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+        http.enforce_http(false);
+        http.set_connect_timeout(Some(cfg.timeout));
+        let connector = crate::build_https_connector(http, cfg.tls.clone())?;
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        Self {
+        let scheme = if cfg.tls.is_some() { "https" } else { "http" };
+        Ok(Self {
             addrs,
             breakers,
             cfg,
             client,
-        }
+            scheme,
+        })
     }
 
     /// Drive the probe loops until `cancel.load(Acquire)` returns true.
@@ -93,9 +125,10 @@ impl Probe {
             let breakers = Arc::clone(&self.breakers);
             let client = self.client.clone();
             let cfg = self.cfg.clone();
+            let scheme = self.scheme;
             let cancel = Arc::clone(&cancel);
             tasks.push(tokio::spawn(async move {
-                run_one(addr, breakers, idx, client, cfg, cancel).await;
+                run_one(addr, breakers, idx, client, cfg, scheme, cancel).await;
             }));
         }
         for t in tasks {
@@ -108,15 +141,16 @@ async fn run_one(
     addr: SocketAddr,
     breakers: Arc<[Breaker]>,
     idx: usize,
-    client: Client<hyper_util::client::legacy::connect::HttpConnector, Empty<Bytes>>,
+    client: ProbeClient,
     cfg: ProbeConfig,
+    scheme: &'static str,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let breaker = &breakers[idx];
     let mut consecutive_fail = 0u32;
     let mut consecutive_ok = 0u32;
     while !cancel.load(std::sync::atomic::Ordering::Acquire) {
-        let healthy = probe_once(&client, addr, &cfg.path, cfg.timeout).await;
+        let healthy = probe_once(&client, scheme, addr, &cfg.path, cfg.timeout).await;
         if healthy {
             consecutive_fail = 0;
             consecutive_ok = consecutive_ok.saturating_add(1);
@@ -143,7 +177,8 @@ async fn run_one(
 }
 
 async fn probe_once(
-    client: &Client<hyper_util::client::legacy::connect::HttpConnector, Empty<Bytes>>,
+    client: &ProbeClient,
+    scheme: &str,
     addr: SocketAddr,
     path: &str,
     timeout: Duration,
@@ -153,7 +188,7 @@ async fn probe_once(
     } else {
         format!("/{path}")
     };
-    let Ok(uri) = format!("http://{addr}{path_normalized}").parse::<http::Uri>() else {
+    let Ok(uri) = format!("{scheme}://{addr}{path_normalized}").parse::<http::Uri>() else {
         return false;
     };
     let Ok(req) = http::Request::builder()

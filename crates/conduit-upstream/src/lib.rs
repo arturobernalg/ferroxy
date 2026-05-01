@@ -175,7 +175,7 @@ pub enum TlsLoadError {
     MismatchedClientCert,
 }
 
-fn build_https_connector(
+pub(crate) fn build_https_connector(
     http: hyper_util::client::legacy::connect::HttpConnector,
     tls: Option<UpstreamTlsOptions>,
 ) -> Result<Connector, TlsLoadError> {
