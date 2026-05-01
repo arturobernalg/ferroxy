@@ -150,7 +150,24 @@ impl Upstream {
         addrs: Vec<std::net::SocketAddr>,
         breaker: BreakerConfig,
     ) -> Self {
-        let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        Self::with_options(retry, addrs, breaker, None)
+    }
+
+    /// Full constructor: retry policy, addrs, breaker config, and
+    /// optional per-upstream connect timeout. The connect timeout
+    /// applies to the TCP connect to a single backend address; the
+    /// per-route total timeout (P5.x) is a separate, larger budget
+    /// covering connect + send + recv.
+    pub fn with_options(
+        retry: RetryPolicy,
+        addrs: Vec<std::net::SocketAddr>,
+        breaker: BreakerConfig,
+        connect_timeout: Option<Duration>,
+    ) -> Self {
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        if let Some(d) = connect_timeout {
+            connector.set_connect_timeout(Some(d));
+        }
         let client = Client::builder(TokioExecutor::new()).build(connector);
         // One breaker per addr. Vec → Arc<[T]> avoids per-request
         // refcount work; the breakers themselves are interior-mutable.

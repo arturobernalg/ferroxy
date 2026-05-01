@@ -277,12 +277,19 @@ impl UpstreamMap {
     pub fn from_config(cfg: &conduit_config::Config) -> Self {
         let mut map = Self::new();
         for u in &cfg.upstreams {
-            // P5 ships with a default (no-retry) Upstream per name and
-            // forwards to the upstream's first listed address — load
-            // balancing across multiple addresses is P5.x.
+            // Per-upstream connect timeout from `[upstream] connect_timeout`.
+            // Configures hyper-util's HttpConnector; the per-route
+            // total timeout is a separate, larger budget owned by the
+            // dispatcher.
+            let connect: std::time::Duration = u.connect_timeout.into();
             map.insert(
                 u.name.clone(),
-                Upstream::with_addrs(conduit_upstream::RetryPolicy::default(), u.addrs.clone()),
+                Upstream::with_options(
+                    conduit_upstream::RetryPolicy::default(),
+                    u.addrs.clone(),
+                    conduit_upstream::BreakerConfig::default(),
+                    Some(connect),
+                ),
             );
         }
         map
