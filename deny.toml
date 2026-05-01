@@ -63,23 +63,22 @@ allow-git = []
 multiple-versions = "warn"
 wildcards = "deny"
 
-# Layer 1 — io: bottom of the stack. Used by transport, every protocol
-# crate (their accept-side glue), upstream (egress sockets), control
-# (admin listener), and the binary.
+# Wrapper lists below are the **actually-used** dependents for each
+# layer, not the anticipated future graph. When a new edge lands
+# (e.g. control starts consuming upstream stats), add the wrapper in
+# the same commit that adds the dep — keeping the list trimmed makes
+# `cargo deny check` output noise-free, which makes a real failure
+# obvious.
+
+# Layer 1 — io: bound directly only by the binary today. The
+# protocol crates take any tokio-shaped stream (the binary feeds
+# them an io::TcpStream).
 [[bans.deny]]
 crate = "conduit-io"
-wrappers = [
-    "conduit-transport",
-    "conduit-h1",
-    "conduit-h2",
-    "conduit-h3",
-    "conduit-upstream",
-    "conduit-control",
-    "conduit",
-]
+wrappers = ["conduit"]
 
-# Layer 3 contract — proto: the request/response stream type. Every protocol
-# crate, upstream, lifecycle, control surfaces it; binary wires it.
+# Layer 3 contract — proto: the request/response stream type. Every
+# protocol crate, upstream, lifecycle, and the binary depend on it.
 [[bans.deny]]
 crate = "conduit-proto"
 wrappers = [
@@ -88,16 +87,13 @@ wrappers = [
     "conduit-h3",
     "conduit-upstream",
     "conduit-lifecycle",
-    "conduit-control",
     "conduit",
 ]
 
-# Layer 6 — config: read by control (orchestration), upstream
-# (RetryPolicy::from_config and other per-route knobs in P4+),
-# lifecycle (RouteTable / UpstreamMap from_config in P5+), and
-# transport (TlsConfig → rustls::ServerConfig in P6+).
-# The binary loads the document directly today; once the control
-# layer ships in P10 the binary will go through it instead.
+# Config: read by control (orchestration), upstream
+# (RetryPolicy / UpstreamTlsOptions::from_config), lifecycle
+# (RouteTable / UpstreamMap::from_config), transport
+# (TlsConfig → rustls::ServerConfig), and the binary.
 [[bans.deny]]
 crate = "conduit-config"
 wrappers = [
@@ -108,47 +104,46 @@ wrappers = [
     "conduit",
 ]
 
-# Layer 2 — transport: TLS + QUIC. Used by every protocol crate (server
-# side), upstream (egress TLS), control (admin TLS, eventually).
+# Layer 2 — transport: today the binary calls accept_tls directly
+# and hands the TLS-wrapped stream to conduit-h1 / conduit-h2. The
+# protocol crates do not depend on transport — they take any
+# tokio-shaped stream.
 [[bans.deny]]
 crate = "conduit-transport"
-wrappers = [
-    "conduit-h1",
-    "conduit-h2",
-    "conduit-h3",
-    "conduit-upstream",
-    "conduit-control",
-    "conduit",
-]
+wrappers = ["conduit"]
 
-# Layer 3 — h1: upstream pool (client) and the binary use it
-# directly. Server-side wiring goes through transport+lifecycle.
-# `conduit-lifecycle` carries an integration-test dev-dependency on
-# h1 so it can demonstrate the full ingress→dispatch→upstream
-# composition in `tests/end_to_end.rs`. The dev-dep does not appear
-# in any production build graph.
+# Layer 3 — h1: upstream client pool depends on it via hyper-util;
+# lifecycle uses it as a dev-dependency for the end-to-end test;
+# the binary calls serve_connection directly.
 [[bans.deny]]
 crate = "conduit-h1"
-wrappers = ["conduit-upstream", "conduit-lifecycle", "conduit"]
+wrappers = ["conduit-lifecycle", "conduit"]
 
+# Layer 3 — h2: only the binary calls it directly (ALPN dispatch).
 [[bans.deny]]
 crate = "conduit-h2"
-wrappers = ["conduit-upstream", "conduit"]
+wrappers = ["conduit"]
 
+# Layer 3 — h3: only the binary calls it directly (QUIC listener).
 [[bans.deny]]
 crate = "conduit-h3"
-wrappers = ["conduit-upstream", "conduit"]
+wrappers = ["conduit"]
 
-# Layer 5 — upstream: lifecycle dispatches to it; control reads stats; the
-# binary holds the runtime.
+# Layer 5 — upstream: lifecycle dispatches to it, the binary
+# spawns its health probes.
 [[bans.deny]]
 crate = "conduit-upstream"
-wrappers = ["conduit-lifecycle", "conduit-control", "conduit"]
+wrappers = ["conduit-lifecycle", "conduit"]
 
-# Layer 4 — lifecycle: control orchestrates it, binary wires it.
+# Layer 4 — lifecycle: only the binary holds the Dispatch.
 [[bans.deny]]
 crate = "conduit-lifecycle"
-wrappers = ["conduit-control", "conduit"]
+wrappers = ["conduit"]
+
+# Layer 6 — control: only the binary holds the admin server.
+[[bans.deny]]
+crate = "conduit-control"
+wrappers = ["conduit"]
 
 # Layer 6 — control: only the binary depends on it.
 [[bans.deny]]
