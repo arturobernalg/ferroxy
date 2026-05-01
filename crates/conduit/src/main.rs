@@ -16,11 +16,12 @@
 
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use clap::Parser;
 use conduit_io::{serve, ServeSpec, ShutdownReport};
@@ -28,6 +29,10 @@ use conduit_lifecycle::Dispatch;
 use conduit_proto::{boxed, Response, StatusCode, VecBody};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+
+/// Live dispatch table — hot-swapped under SIGHUP. The hot path
+/// loads a snapshot once per request and never takes a Mutex.
+type DispatchSwap = Arc<ArcSwap<Dispatch>>;
 
 mod log;
 
@@ -96,9 +101,22 @@ fn main() -> ExitCode {
     let mut spec = ServeSpec::new(cfg.server.listen_http.clone(), workers);
     spec.cpu_affinity = cfg.server.cpu_affinity;
 
-    // Build the lifecycle dispatcher from the config. Arc-wrapped so
-    // the per-connection handler closures share one read-only copy.
-    let dispatch = Arc::new(Dispatch::from_config(&cfg));
+    // Build the lifecycle dispatcher from the config. Wrapped in an
+    // ArcSwap so SIGHUP can replace it atomically without taking a
+    // lock on the hot path. Each request loads a snapshot Arc once.
+    let dispatch: DispatchSwap = Arc::new(ArcSwap::new(Arc::new(Dispatch::from_config(&cfg))));
+
+    // SIGHUP-driven hot-reload: re-read the config from disk on each
+    // signal and atomically swap the live Dispatch. New requests see
+    // the new routes/upstreams; in-flight requests keep their old
+    // snapshot. Shutdown (sigterm/sigint) propagates via `done` so the
+    // reload thread doesn't outlive the data plane.
+    let reload_done = Arc::new(AtomicBool::new(false));
+    let reload_thread = spawn_reload_thread(
+        cli.config.clone(),
+        Arc::clone(&dispatch),
+        Arc::clone(&reload_done),
+    );
 
     // Spawn HTTPS listener if `[tls]` and `listen_https` are both
     // configured. The HTTPS listener runs on its own tokio runtime
@@ -149,6 +167,9 @@ fn main() -> ExitCode {
             ShutdownReport::default()
         }
     };
+
+    reload_done.store(true, Ordering::Release);
+    let _ = reload_thread.join();
 
     join_aux_threads(
         &admin_cancel,
@@ -247,7 +268,7 @@ fn error_response(status: StatusCode, body: &'static str) -> Response<conduit_pr
 /// with a per-request service that calls `Dispatch::handle`.
 fn start_http_server(
     spec: ServeSpec,
-    dispatch: Arc<Dispatch>,
+    dispatch: DispatchSwap,
 ) -> Result<conduit_io::Server, conduit_io::BindError> {
     let server = serve(spec, move || {
         let dispatch = Arc::clone(&dispatch);
@@ -256,7 +277,7 @@ fn start_http_server(
             async move {
                 tracing::debug!(?peer, "accepted connection");
                 let handler = move |req: http::Request<Incoming>| {
-                    let dispatch = Arc::clone(&dispatch);
+                    let dispatch = dispatch.load_full();
                     async move { proxy_one(&dispatch, req).await }
                 };
                 if let Err(e) = conduit_h1::serve_connection(stream, handler).await {
@@ -275,7 +296,7 @@ fn start_http_server(
 /// continues with HTTP-only in that case.
 fn spawn_https_thread(
     cfg: &conduit_config::Config,
-    dispatch: &Arc<Dispatch>,
+    dispatch: &DispatchSwap,
 ) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
     if cfg.server.listen_https.is_empty() {
         return None;
@@ -395,7 +416,7 @@ fn install_signal_handler(parent_done: &AtomicBool, on_signal: impl FnOnce()) {
 fn run_https(
     addrs: Vec<std::net::SocketAddr>,
     acceptor: conduit_transport::TlsAcceptor,
-    dispatch: Arc<Dispatch>,
+    dispatch: DispatchSwap,
     cancel: Arc<AtomicBool>,
 ) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -462,7 +483,7 @@ fn run_https(
                         // and absent ALPN) → conduit-h1.
                         let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
                         let handler = move |req: http::Request<Incoming>| {
-                            let dispatch = Arc::clone(&dispatch);
+                            let dispatch = dispatch.load_full();
                             async move { proxy_one(&dispatch, req).await }
                         };
                         match alpn.as_deref() {
@@ -493,6 +514,60 @@ fn run_https(
             let _ = t.await;
         }
     });
+}
+
+/// Spawn a thread that listens for SIGHUP and atomically swaps the
+/// live `Dispatch` with one rebuilt from the config file at `path`.
+/// Returns the join handle; `done` flipping true causes the thread to
+/// exit on the next signal (or wake-up).
+fn spawn_reload_thread(
+    path: PathBuf,
+    dispatch: DispatchSwap,
+    done: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("conduit-reload".into())
+        .spawn(move || {
+            install_reload_handler(&path, &dispatch, &done);
+        })
+        .expect("spawn reload thread")
+}
+
+/// Block on SIGHUP, re-read the config, build a new `Dispatch`, and
+/// atomically swap it in via `ArcSwap::store`. Errors during reload
+/// are logged and the live dispatcher is left untouched (charter
+/// rule: a bad reload must not break a running proxy).
+fn install_reload_handler(path: &Path, dispatch: &DispatchSwap, done: &AtomicBool) {
+    use signal_hook::consts::signal::SIGHUP;
+    use signal_hook::iterator::Signals;
+
+    let mut signals = match Signals::new([SIGHUP]) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot install SIGHUP handler; hot-reload disabled");
+            return;
+        }
+    };
+    for _signal in signals.forever() {
+        if done.load(Ordering::Acquire) {
+            return;
+        }
+        tracing::info!(path = %path.display(), "received SIGHUP; reloading config");
+        match conduit_config::load(path) {
+            Ok(cfg) => {
+                let new_dispatch = Arc::new(Dispatch::from_config(&cfg));
+                dispatch.store(new_dispatch);
+                tracing::info!(
+                    upstreams = cfg.upstreams.len(),
+                    routes = cfg.routes.len(),
+                    "reload succeeded; new dispatch active",
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "reload failed; keeping previous config");
+            }
+        }
+    }
 }
 
 /// Spawn the signal-handler thread. Returns the parent-done flag (so
@@ -559,7 +634,7 @@ fn join_aux_threads(
 /// continues without H3 in that case.
 fn spawn_h3_thread(
     cfg: &conduit_config::Config,
-    dispatch: &Arc<Dispatch>,
+    dispatch: &DispatchSwap,
 ) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
     if cfg.server.listen_h3.is_empty() {
         return None;
@@ -610,7 +685,7 @@ fn spawn_h3_thread(
 fn run_h3(
     addrs: Vec<std::net::SocketAddr>,
     quic_cfg: quinn::ServerConfig,
-    dispatch: Arc<Dispatch>,
+    dispatch: DispatchSwap,
     cancel: Arc<AtomicBool>,
 ) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -667,7 +742,7 @@ fn run_h3(
                         };
                         let peer = conn.remote_address();
                         let handler = move |req: http::Request<Bytes>| {
-                            let dispatch = Arc::clone(&dispatch);
+                            let dispatch = dispatch.load_full();
                             async move {
                                 let (parts, body) = req.into_parts();
                                 let req = http::Request::from_parts(

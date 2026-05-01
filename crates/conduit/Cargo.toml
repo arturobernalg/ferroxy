@@ -35,6 +35,7 @@ hyper = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 quinn = { workspace = true }
+arc-swap = { workspace = true }
 
 conduit-config = { workspace = true }
 conduit-io = { workspace = true }
