@@ -110,6 +110,11 @@ pub struct Upstream {
     client: Client<Connector, BodyOf<Bytes>>,
     retry: RetryPolicy,
     addrs: std::sync::Arc<[std::net::SocketAddr]>,
+    /// Pre-built `Authority` per backend address, indexed parallel
+    /// with `addrs`. Built once at construction so per-request URI
+    /// rewrites just clone (refcount bump on the inner `Bytes`)
+    /// rather than re-running `addr.to_string()` + parse.
+    authorities: std::sync::Arc<[http::uri::Authority]>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// One passive circuit breaker per backend address, indexed in
     /// parallel with `addrs`. A bad backend is ejected from the
@@ -175,20 +180,21 @@ pub enum TlsLoadError {
     MismatchedClientCert,
 }
 
-/// Rebuild `original` with scheme `http` and authority pointing at
-/// `addr`, keeping the existing path-and-query. Avoids the
-/// `format!("http://{addr}{path}")` + `.parse()` round-trip the
-/// previous implementation did per request.
+/// Rebuild `original` with scheme `http` and the supplied authority
+/// (a pre-built `Authority` whose `Bytes` are shared with the
+/// `Upstream`'s `authorities` array — clone is a refcount bump).
 ///
-/// `Authority::from_maybe_shared` parses but doesn't reallocate
-/// the `addr.to_string()` buffer (it stores it as `Bytes`), so the
-/// only allocation here is the addr's stringification — same as
-/// before, but without the path-and-query copy.
-fn rewrite_uri(original: &http::Uri, addr: std::net::SocketAddr) -> Result<http::Uri, http::Error> {
+/// Per-request allocations: zero for the authority, zero for the
+/// path-and-query (moved through), zero for the scheme (constant).
+/// The `from_parts` may allocate internally for the assembled `Uri`
+/// representation, but no String formatting happens.
+fn rewrite_uri(
+    original: &http::Uri,
+    authority: http::uri::Authority,
+) -> Result<http::Uri, http::Error> {
     let mut parts = original.clone().into_parts();
     parts.scheme = Some(http::uri::Scheme::HTTP);
-    let authority_bytes = bytes::Bytes::from(addr.to_string());
-    parts.authority = Some(http::uri::Authority::from_maybe_shared(authority_bytes)?);
+    parts.authority = Some(authority);
     if parts.path_and_query.is_none() {
         parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
     }
@@ -416,10 +422,23 @@ impl Upstream {
         let connector = build_https_connector(http, tls)?;
         let client = Client::builder(TokioExecutor::new()).build(connector);
         let breakers: Vec<Breaker> = (0..addrs.len()).map(|_| Breaker::new(breaker)).collect();
+        // Pre-build authorities at construction time. The
+        // `from_maybe_shared` path takes ownership of the bytes
+        // without copying; we keep the resulting Authority for the
+        // lifetime of the Upstream and clone (refcount-only) on
+        // every request.
+        let authorities: Vec<http::uri::Authority> = addrs
+            .iter()
+            .map(|a| {
+                http::uri::Authority::from_maybe_shared(bytes::Bytes::from(a.to_string()))
+                    .expect("SocketAddr always renders as a valid Authority")
+            })
+            .collect();
         Ok(Self {
             client,
             retry,
             addrs: addrs.into(),
+            authorities: authorities.into(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             breakers: breakers.into(),
         })
@@ -545,8 +564,11 @@ impl Upstream {
             None
         } else {
             match self.pick_addr() {
-                Some((addr, idx)) => {
-                    parts.uri = rewrite_uri(&parts.uri, addr).map_err(|e| {
+                Some((_addr, idx)) => {
+                    // Authority is pre-built and shared — clone is
+                    // a refcount bump on the inner Bytes.
+                    let authority = self.authorities[idx].clone();
+                    parts.uri = rewrite_uri(&parts.uri, authority).map_err(|e| {
                         ForwardError::Body(Box::new(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             e.to_string(),
