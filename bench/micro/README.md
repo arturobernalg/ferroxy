@@ -32,25 +32,28 @@ profile (`opt-level = 3`, `lto = "thin"`). Criterion full run
 
 | Scenario                          | Median time |
 |-----------------------------------|-------------|
-| Exact host, first prefix in bucket | 40 ns       |
-| Exact host, last prefix in bucket  | 52 ns       |
-| Wildcard fallback (host miss)      | 33 ns       |
+| Exact host, first prefix in bucket | 25 ns       |
+| Exact host, last prefix in bucket  | 44 ns       |
+| Wildcard fallback (host miss)      | 25 ns       |
 
-Interpretation: the routing layer adds at most ~52 ns to the request
+Interpretation: the routing layer adds at most ~44 ns to the request
 path at this table size. The longest-prefix scan inside the bucket
 is what stretches the upper bound — the bucket holds 10 prefix
 entries and our walk is linear within a bucket. A trie would flatten
 that to O(|path|) but the constant factor at this scale is not yet
 worth the trie machinery.
 
-> **Note on numbers since first baseline**: the original 37 / 50 / 32
-> baseline was taken before header-based routing landed. The bucket
-> now holds extra slots (regex routes, header-match candidate lists)
-> and `find` calls `Route::headers_match` on each candidate. With an
-> empty HeaderMap and no header predicates the cost is one branch +
-> one function call per candidate (~2-3 ns); the new baseline reflects
-> that. If a future change pushes any of these past 60 ns at this
-> table size, the commit message must justify the regression.
+#### Baseline history
+
+| Date       | first | last | wildcard | Reason                                                          |
+|------------|------:|-----:|---------:|-----------------------------------------------------------------|
+| 2026-05-01 |  37 ns | 50 ns |  32 ns | Initial baseline (linear scan replaced by host bucket).         |
+| 2026-05-01 |  40 ns | 52 ns |  33 ns | Header-routing landed; per-slot Vec + headers_match call added. |
+| 2026-05-01 |  25 ns | 44 ns |  25 ns | `lookup_bucket` skips `to_ascii_lowercase` alloc for lowercase hosts (the common case). |
+
+Future PRs that touch the routing hot path must rerun this bench
+and update the table; a regression beyond noise needs a commit
+message that justifies the trade.
 
 ### Methodology
 

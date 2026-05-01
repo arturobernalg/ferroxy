@@ -259,15 +259,25 @@ impl RouteTable {
         headers: &http::HeaderMap,
     ) -> Option<&Route> {
         if let Some(h) = host {
-            // ASCII-only fold; HTTP host names are ASCII.
-            let key = h.to_ascii_lowercase();
-            if let Some(bucket) = self.by_host.get(&key) {
+            if let Some(bucket) = self.lookup_bucket(h) {
                 if let Some(r) = bucket.find(path, headers) {
                     return Some(r);
                 }
             }
         }
         self.wildcard.find(path, headers)
+    }
+
+    /// Look up a host bucket. Avoids allocating a lowercased copy of
+    /// the host when the input is already all-ASCII-lowercase (the
+    /// common case for properly-configured clients). Mixed-case hosts
+    /// fall back to a one-shot allocation; this is rare in practice.
+    fn lookup_bucket(&self, host: &str) -> Option<&HostBucket> {
+        if host.bytes().all(|b| !b.is_ascii_uppercase()) {
+            return self.by_host.get(host);
+        }
+        let lower = host.to_ascii_lowercase();
+        self.by_host.get(&lower)
     }
 
     /// Number of routes (for observability / tests).
