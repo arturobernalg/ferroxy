@@ -1,0 +1,133 @@
+# cargo-deny configuration for ferroxy.
+#
+# Targets cargo-deny v0.16+ schema (version = 2 where the section supports it).
+# Enforces:
+#   - No advisories (RUSTSEC). Yanked deps are denied.
+#   - Allow only the standard permissive licenses. New license = explicit
+#     decision in this file.
+#   - No wildcard versions, no unknown-source git/registry deps.
+#   - Layer-direction enforcement via [[bans.deny]] with `wrappers`: each
+#     internal crate lists the only set of crates allowed to have a direct
+#     dependency on it. Adding an upward edge fails the gate.
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+private = { ignore = true }
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# ---------------------------------------------------------------------------
+# bans
+# ---------------------------------------------------------------------------
+# `multiple-versions = "warn"` keeps duplicate transitive deps visible
+# without breaking the gate; we'll tighten as the dep graph stabilises.
+# `wildcards = "deny"` is non-negotiable: pinned ranges only.
+#
+# Layer model expressed as wrapper allowlists. For each ferroxy-* crate,
+# `wrappers` lists every crate permitted to depend on it directly. Anything
+# else is rejected.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# Layer 1 — io: bottom of the stack. Used by transport, every protocol
+# crate (their accept-side glue), upstream (egress sockets), control
+# (admin listener), and the binary.
+[[bans.deny]]
+crate = "ferroxy-io"
+wrappers = [
+    "ferroxy-transport",
+    "ferroxy-h1",
+    "ferroxy-h2",
+    "ferroxy-h3",
+    "ferroxy-upstream",
+    "ferroxy-control",
+    "ferroxy",
+]
+
+# Layer 3 contract — proto: the request/response stream type. Every protocol
+# crate, upstream, lifecycle, control surfaces it; binary wires it.
+[[bans.deny]]
+crate = "ferroxy-proto"
+wrappers = [
+    "ferroxy-h1",
+    "ferroxy-h2",
+    "ferroxy-h3",
+    "ferroxy-upstream",
+    "ferroxy-lifecycle",
+    "ferroxy-control",
+    "ferroxy",
+]
+
+# Layer 6 — config: only control consumes it (the binary loads it via
+# control or directly during phase 0).
+[[bans.deny]]
+crate = "ferroxy-config"
+wrappers = ["ferroxy-control", "ferroxy"]
+
+# Layer 2 — transport: TLS + QUIC. Used by every protocol crate (server
+# side), upstream (egress TLS), control (admin TLS, eventually).
+[[bans.deny]]
+crate = "ferroxy-transport"
+wrappers = [
+    "ferroxy-h1",
+    "ferroxy-h2",
+    "ferroxy-h3",
+    "ferroxy-upstream",
+    "ferroxy-control",
+    "ferroxy",
+]
+
+# Layer 3 — h1: only the upstream pool (client) and the binary use it
+# directly. Server-side wiring goes through transport+lifecycle.
+[[bans.deny]]
+crate = "ferroxy-h1"
+wrappers = ["ferroxy-upstream", "ferroxy"]
+
+[[bans.deny]]
+crate = "ferroxy-h2"
+wrappers = ["ferroxy-upstream", "ferroxy"]
+
+[[bans.deny]]
+crate = "ferroxy-h3"
+wrappers = ["ferroxy-upstream", "ferroxy"]
+
+# Layer 5 — upstream: lifecycle dispatches to it; control reads stats; the
+# binary holds the runtime.
+[[bans.deny]]
+crate = "ferroxy-upstream"
+wrappers = ["ferroxy-lifecycle", "ferroxy-control", "ferroxy"]
+
+# Layer 4 — lifecycle: control orchestrates it, binary wires it.
+[[bans.deny]]
+crate = "ferroxy-lifecycle"
+wrappers = ["ferroxy-control", "ferroxy"]
+
+# Layer 6 — control: only the binary depends on it.
+[[bans.deny]]
+crate = "ferroxy-control"
+wrappers = ["ferroxy"]

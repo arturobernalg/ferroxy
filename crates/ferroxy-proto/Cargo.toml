@@ -1,0 +1,12 @@
+[package]
+name = "ferroxy-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Layer 3 contract: the request/response stream type that h1, h2, h3, and lifecycle agree on."
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,12 @@
+[package]
+name = "ferroxy-lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Layer 4: routing, filter chain, body piping, timeouts, trailer propagation."
+
+[lints]
+workspace = true
+
+[dependencies]

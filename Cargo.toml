@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ferroxy",
+    "crates/ferroxy-config",
+    "crates/ferroxy-control",
+    "crates/ferroxy-h1",
+    "crates/ferroxy-h2",
+    "crates/ferroxy-h3",
+    "crates/ferroxy-io",
+    "crates/ferroxy-lifecycle",
+    "crates/ferroxy-proto",
+    "crates/ferroxy-transport",
+    "crates/ferroxy-upstream",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/ferroxy"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# pedantic lints we deliberately silence project-wide
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+# enforce: no panicking shortcuts on hot paths (will tighten per-crate later)
+expect_used = "allow"
+unwrap_used = "allow"
+
+[workspace.dependencies]
+# Phase 0 only declares deps it actually uses. Runtime, io, transport,
+# and protocol deps land as their owning phase ships.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# internal
+ferroxy-config = { path = "crates/ferroxy-config", version = "0.1.0" }
+ferroxy-control = { path = "crates/ferroxy-control", version = "0.1.0" }
+ferroxy-h1 = { path = "crates/ferroxy-h1", version = "0.1.0" }
+ferroxy-h2 = { path = "crates/ferroxy-h2", version = "0.1.0" }
+ferroxy-h3 = { path = "crates/ferroxy-h3", version = "0.1.0" }
+ferroxy-io = { path = "crates/ferroxy-io", version = "0.1.0" }
+ferroxy-lifecycle = { path = "crates/ferroxy-lifecycle", version = "0.1.0" }
+ferroxy-proto = { path = "crates/ferroxy-proto", version = "0.1.0" }
+ferroxy-transport = { path = "crates/ferroxy-transport", version = "0.1.0" }
+ferroxy-upstream = { path = "crates/ferroxy-upstream", version = "0.1.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

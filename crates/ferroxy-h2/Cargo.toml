@@ -1,0 +1,12 @@
+[package]
+name = "ferroxy-h2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Layer 3: HTTP/2 (RFC 9113). HPACK with bounded dynamic table."
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,22 @@
+[package]
+name = "ferroxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reverse proxy binary; wires every layer crate."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ferroxy"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+ferroxy-config = { workspace = true }

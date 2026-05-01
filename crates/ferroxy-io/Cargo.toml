@@ -1,0 +1,12 @@
+[package]
+name = "ferroxy-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Layer 1: listeners, accept loop, worker model, buffer pool."
+
+[lints]
+workspace = true
+
+[dependencies]
