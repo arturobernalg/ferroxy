@@ -210,10 +210,27 @@ where
     metrics.observe_request_start();
     let started = std::time::Instant::now();
     let result = dispatch.handle(req).await;
-    // Record latency *before* we burn cycles on body conversion or
-    // synthetic-error builders. The histogram represents end-to-end
-    // routing + upstream wall time; per-stage breakdowns are P11.5.
-    metrics.observe_request_duration(started.elapsed());
+    let elapsed = started.elapsed();
+    // Determine the status we'll surface so per-class histogram +
+    // per-class counter agree. Recorded *before* the body
+    // conversion / synthetic-error builders so the histogram
+    // represents end-to-end routing + upstream wall time; per-stage
+    // breakdowns are P11.5 scope.
+    let status_for_metrics = match &result {
+        Ok(resp) => resp.status().as_u16(),
+        Err(conduit_lifecycle::DispatchError::NoRoute) => 404,
+        Err(conduit_lifecycle::DispatchError::Upstream(e)) => {
+            if matches!(e, conduit_upstream::ForwardError::BreakerOpen) {
+                503
+            } else {
+                502
+            }
+        }
+        Err(conduit_lifecycle::DispatchError::Timeout(_)) => 504,
+        // UpstreamNotRegistered + any future non_exhaustive variant.
+        Err(_) => 500,
+    };
+    metrics.observe_request_duration(elapsed, status_for_metrics);
     match result {
         Ok(resp) => {
             metrics.observe_status(resp.status().as_u16());

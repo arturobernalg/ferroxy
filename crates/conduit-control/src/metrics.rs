@@ -13,6 +13,22 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Map an HTTP status code to its histogram bucket index, or `None`
+/// for statuses outside the 2xx..5xx tracked range. Indexed:
+/// 0 = 2xx, 1 = 3xx, 2 = 4xx, 3 = 5xx.
+fn class_index(status: u16) -> Option<usize> {
+    match status / 100 {
+        2 => Some(0),
+        3 => Some(1),
+        4 => Some(2),
+        5 => Some(3),
+        _ => None,
+    }
+}
+
+/// Status-class label strings used in Prometheus exposition.
+const CLASS_LABELS: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
+
 /// Prometheus-default histogram bucket boundaries, in seconds. The
 /// last "bucket" is `+Inf`, encoded as a wrapping bump of
 /// `requests_total` (Prometheus's text format requires `+Inf` to be
@@ -47,15 +63,28 @@ pub struct MetricsHandle {
     pub responses_4xx: AtomicU64,
     /// Requests that completed with a 5xx status code.
     pub responses_5xx: AtomicU64,
-    /// Cumulative request duration in microseconds. Paired with
-    /// `requests_total` to compute the histogram's average; required
-    /// by Prometheus exposition.
+    /// Cumulative request duration in microseconds, summed across
+    /// every observation regardless of status class. Paired with
+    /// `requests_total` to compute the histogram's average.
     pub request_duration_us_sum: AtomicU64,
-    /// Cumulative-count buckets matching `LATENCY_BUCKETS_S`.
-    /// Cumulative means each bucket counts every observation `<= le`,
-    /// so reading at index `i` gives the count of requests that
-    /// completed in `<= LATENCY_BUCKETS_S[i]` seconds.
+    /// Cumulative-count buckets matching `LATENCY_BUCKETS_S`,
+    /// summed across every observation. Reading at index `i` gives
+    /// the count of requests that completed in `<= LATENCY_BUCKETS_S[i]`
+    /// seconds.
     request_duration_buckets: [AtomicU64; LATENCY_BUCKETS_S.len()],
+    /// Per-status-class duration histograms. Each entry holds its
+    /// own bucket array + sum, so dashboards can split p99 of
+    /// successes vs p99 of errors without the operator doing
+    /// `PromQL` math. Indexed: 0 = 2xx, 1 = 3xx, 2 = 4xx, 3 = 5xx.
+    request_duration_by_class: [ClassHistogram; 4],
+}
+
+/// One status-class histogram. Same shape as the global one but
+/// filtered to a single status-class.
+#[derive(Debug, Default)]
+struct ClassHistogram {
+    sum_us: AtomicU64,
+    buckets: [AtomicU64; LATENCY_BUCKETS_S.len()],
 }
 
 impl MetricsHandle {
@@ -71,18 +100,35 @@ impl MetricsHandle {
     }
 
     /// Record the wall-clock duration of a completed request. Bumps
-    /// every cumulative bucket whose `le` is `>=` the observed duration
-    /// and adds the elapsed microseconds to `request_duration_us_sum`.
-    pub fn observe_request_duration(&self, elapsed: Duration) {
+    /// every cumulative bucket whose `le` is `>=` the observed
+    /// duration in *both* the global histogram and the per-class
+    /// histogram for the response status. Statuses outside 2xx-5xx
+    /// (e.g. 1xx informationals) are recorded only in the global
+    /// histogram.
+    pub fn observe_request_duration(&self, elapsed: Duration, status: u16) {
         let secs = elapsed.as_secs_f64();
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+
+        // Global histogram (every observation).
         for (i, le) in LATENCY_BUCKETS_S.iter().enumerate() {
             if secs <= *le {
                 self.request_duration_buckets[i].fetch_add(1, Ordering::Relaxed);
             }
         }
-        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         self.request_duration_us_sum
             .fetch_add(us, Ordering::Relaxed);
+
+        // Per-class histogram. 1xx and unknown classes (≥ 600) skip
+        // this; they're already counted in the global one.
+        if let Some(idx) = class_index(status) {
+            let h = &self.request_duration_by_class[idx];
+            for (i, le) in LATENCY_BUCKETS_S.iter().enumerate() {
+                if secs <= *le {
+                    h.buckets[i].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            h.sum_us.fetch_add(us, Ordering::Relaxed);
+        }
     }
 
     /// Record a "no matching route" outcome for the just-observed request.
@@ -106,14 +152,15 @@ impl MetricsHandle {
     /// the helper bins it into 2xx/3xx/4xx/5xx. 1xx is not tracked
     /// (we do not surface informational responses today).
     pub fn observe_status(&self, status: u16) {
-        let counter = match status / 100 {
-            2 => &self.responses_2xx,
-            3 => &self.responses_3xx,
-            4 => &self.responses_4xx,
-            5 => &self.responses_5xx,
-            _ => return,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(idx) = class_index(status) {
+            let counter = match idx {
+                0 => &self.responses_2xx,
+                1 => &self.responses_3xx,
+                2 => &self.responses_4xx,
+                _ => &self.responses_5xx,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Render the counter family as Prometheus 0.0.4 text exposition.
@@ -173,6 +220,49 @@ impl MetricsHandle {
              conduit_request_duration_seconds_count {total}\n\
              conduit_request_duration_seconds_sum {seconds}",
         );
+
+        // Per-status-class histogram: one Prometheus histogram metric
+        // with a `class` label so dashboards can query
+        //   histogram_quantile(0.99, sum by (le) (rate(...{class="2xx"})))
+        // for "p99 of successful responses" without summing across
+        // classes by hand.
+        out.push_str(
+            "# HELP conduit_request_duration_seconds_by_class Latency split by status class.\n\
+             # TYPE conduit_request_duration_seconds_by_class histogram\n",
+        );
+        for (idx, class) in CLASS_LABELS.iter().enumerate() {
+            let h = &self.request_duration_by_class[idx];
+            let mut class_total = 0u64;
+            for (i, le) in LATENCY_BUCKETS_S.iter().enumerate() {
+                let count = load(&h.buckets[i]);
+                if i + 1 == LATENCY_BUCKETS_S.len() {
+                    class_total = count.max(class_total);
+                }
+                let _ = writeln!(
+                    out,
+                    "conduit_request_duration_seconds_by_class_bucket{{class=\"{class}\",le=\"{le}\"}} {count}",
+                );
+            }
+            // Prometheus's `+Inf` count must equal the total
+            // observation count; we feed that from the per-class
+            // counter rather than back-summing buckets.
+            let class_count = match idx {
+                0 => load(&self.responses_2xx),
+                1 => load(&self.responses_3xx),
+                2 => load(&self.responses_4xx),
+                _ => load(&self.responses_5xx),
+            };
+            class_total = class_count.max(class_total);
+            let class_micros = load(&h.sum_us);
+            #[allow(clippy::cast_precision_loss)]
+            let class_seconds = class_micros as f64 / 1_000_000.0;
+            let _ = writeln!(
+                out,
+                "conduit_request_duration_seconds_by_class_bucket{{class=\"{class}\",le=\"+Inf\"}} {class_total}\n\
+                 conduit_request_duration_seconds_by_class_count{{class=\"{class}\"}} {class_total}\n\
+                 conduit_request_duration_seconds_by_class_sum{{class=\"{class}\"}} {class_seconds}",
+            );
+        }
         out
     }
 }
@@ -209,12 +299,14 @@ mod tests {
     #[test]
     fn histogram_buckets_are_cumulative() {
         let m = MetricsHandle::new();
-        // 5ms request → falls into le=0.005 and every larger bucket.
+        // 5ms 200 request → falls into le=0.005 and every larger bucket.
         m.observe_request_start();
-        m.observe_request_duration(Duration::from_millis(5));
-        // 200ms request → falls into le=0.25 and larger.
+        m.observe_status(200);
+        m.observe_request_duration(Duration::from_millis(5), 200);
+        // 200ms 200 request → falls into le=0.25 and larger.
         m.observe_request_start();
-        m.observe_request_duration(Duration::from_millis(200));
+        m.observe_status(200);
+        m.observe_request_duration(Duration::from_millis(200), 200);
         let out = m.render();
         // Both observations are in the 0.25 bucket and beyond.
         assert!(out.contains("conduit_request_duration_seconds_bucket{le=\"0.25\"} 2"));
@@ -238,6 +330,47 @@ mod tests {
             (0.20..=0.21).contains(&value),
             "sum was {value}, expected ~0.205",
         );
+    }
+
+    #[test]
+    fn per_class_histogram_splits_2xx_from_5xx() {
+        let m = MetricsHandle::new();
+        // Two successful requests + one server error, distinct latencies.
+        m.observe_status(200);
+        m.observe_request_duration(Duration::from_millis(2), 200);
+        m.observe_status(204);
+        m.observe_request_duration(Duration::from_millis(8), 204);
+        m.observe_status(503);
+        m.observe_request_duration(Duration::from_millis(900), 503);
+
+        let out = m.render();
+        // Two 2xx observations in 0.01 (and beyond).
+        assert!(out.contains(
+            "conduit_request_duration_seconds_by_class_bucket{class=\"2xx\",le=\"0.01\"} 2"
+        ));
+        // Zero 5xx in 0.01 — the 5xx is at 0.9.
+        assert!(out.contains(
+            "conduit_request_duration_seconds_by_class_bucket{class=\"5xx\",le=\"0.01\"} 0"
+        ));
+        // The 5xx lands in le=1.
+        assert!(out.contains(
+            "conduit_request_duration_seconds_by_class_bucket{class=\"5xx\",le=\"1\"} 1"
+        ));
+        // 2xx count + 5xx count.
+        assert!(out.contains("conduit_request_duration_seconds_by_class_count{class=\"2xx\"} 2"));
+        assert!(out.contains("conduit_request_duration_seconds_by_class_count{class=\"5xx\"} 1"));
+        // 2xx sum is ~0.010s; 5xx sum is ~0.900s.
+        let two_xx_sum = out
+            .lines()
+            .find(|l| l.starts_with("conduit_request_duration_seconds_by_class_sum{class=\"2xx\"}"))
+            .expect("2xx sum");
+        let five_xx_sum = out
+            .lines()
+            .find(|l| l.starts_with("conduit_request_duration_seconds_by_class_sum{class=\"5xx\"}"))
+            .expect("5xx sum");
+        let parse_sum = |l: &str| -> f64 { l.split_whitespace().last().unwrap().parse().unwrap() };
+        assert!((0.009..=0.012).contains(&parse_sum(two_xx_sum)));
+        assert!((0.85..=0.92).contains(&parse_sum(five_xx_sum)));
     }
 
     #[test]
