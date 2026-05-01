@@ -49,6 +49,33 @@ The numbers from the loopback run are **not** the charter targets —
 they are bounded by the python backend's throughput. Use the run as a
 *regression detector* when changing hot paths.
 
+## Build profiles
+
+Two release profiles ship in the workspace `Cargo.toml`:
+
+- **`release`** — opt-level=3, thin LTO, codegen-units=1, line tables.
+  Default for `cargo build --release` and CI. Build time ~30 s on
+  a typical box.
+- **`release-bench`** — same as `release` plus **fat LTO** and
+  symbol stripping. ~2-3× the build time (60-90 s); enables
+  cross-crate inlining of hyper internals into our handlers, which
+  is where most of the compile-time runtime payoff lives.
+
+Use `release-bench` for:
+- The published artefact (release.yml's binary build).
+- Any comparison run against nginx / Pingora.
+- Profile-driven optimisation (the profile data should reflect the
+  optimised binary, not the dev build).
+
+```bash
+cargo build --profile release-bench --bin conduit
+cargo bench --profile release-bench
+```
+
+Microbench numbers under `release-bench` show small gains on the
+routing slice (~1-4%); the larger gains land on end-to-end RPS
+once bench infrastructure exists.
+
 ## Microbenchmarks
 
 Per-component criterion benches live next to their owning crate

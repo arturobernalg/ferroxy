@@ -50,6 +50,7 @@ worth the trie machinery.
 | 2026-05-01 |  37 ns | 50 ns |  32 ns | Initial baseline (linear scan replaced by host bucket).         |
 | 2026-05-01 |  40 ns | 52 ns |  33 ns | Header-routing landed; per-slot Vec + headers_match call added. |
 | 2026-05-01 |  25 ns | 44 ns |  25 ns | `lookup_bucket` skips `to_ascii_lowercase` alloc for lowercase hosts (the common case). |
+| 2026-05-01 |  25 ns | 42 ns |  24 ns | `release-bench` profile (fat-LTO + codegen-units=1). Minor on the routing slice; cross-crate inlining win shows up in end-to-end RPS, not here. |
 
 Future PRs that touch the routing hot path must rerun this bench
 and update the table; a regression beyond noise needs a commit
