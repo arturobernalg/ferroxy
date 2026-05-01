@@ -112,6 +112,34 @@ section accumulates work that hasn't tagged a release yet.
 - Structured access logs via `tracing` (text or JSON via
   `--log-json`).
 
+### Hot-path optimisations
+
+A series of measured allocation reductions on the per-request path,
+each independently small but stacking up. See
+[`bench/micro/README.md`](./bench/micro/README.md) for the
+`route_lookup` baseline that gates regressions.
+
+- **`Dispatch::handle`**: dropped 4 allocations per request (host
+  String, path String, HeaderMap clone) by keeping the request
+  borrows alive only as long as the route lookup needs them.
+- **`RouteTable::find`**: `lookup_bucket` skips
+  `to_ascii_lowercase` allocation when the host header is already
+  lowercase. Bench: 40 → 25 ns first-prefix, 52 → 44 ns last-prefix,
+  33 → 25 ns wildcard fallback.
+- **`Upstream::forward`**: retry loop no longer clones `parts` on
+  the no-retry path (the default policy). Single-attempt forwards
+  are a clean move into `http::Request::from_parts`.
+- **`Upstream::forward`**: URI rewrite uses `Uri::from_parts` instead
+  of `format!() + .parse()`. One allocation instead of three, no
+  reparse.
+- **`UpstreamMap`**: entries stored as `Arc<Upstream>` so the
+  hot-path clone in `Dispatch::handle` is a refcount bump rather
+  than a deep copy of `RetryPolicy.on_status` + 4 inner Arcs.
+- **`MetricsHandle`**: histogram storage switched from cumulative
+  to non-cumulative — each observation bumps exactly one bucket.
+  Cumulative sums computed at scrape time. Per-request atomic ops
+  on the histogram path: ~24 → 2.
+
 ### Build / quality / docs
 - Workspace-wide quality gate: `cargo build --workspace --all-targets
   --release`, `cargo test`, `cargo clippy -- -D warnings`,
