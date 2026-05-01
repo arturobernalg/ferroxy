@@ -37,6 +37,7 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 quinn = { workspace = true }
 arc-swap = { workspace = true }
+pin-project-lite = { workspace = true }
 
 conduit-config = { workspace = true }
 conduit-io = { workspace = true }

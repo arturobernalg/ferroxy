@@ -45,6 +45,11 @@ pub struct Route {
     /// `[[route]] timeouts.total`. The dispatcher wraps the upstream
     /// forward in a `tokio::time::timeout` of this duration.
     pub total_timeout: std::time::Duration,
+    /// Per-frame read deadline, derived from `[[route]] timeouts.read`.
+    /// Applied to the upstream's response body via [`TimedBody`]
+    /// — a slow / silent backend can't tie up a conduit connection
+    /// past this timeout regardless of the total budget.
+    pub read_timeout: std::time::Duration,
 }
 
 impl Route {
@@ -121,6 +126,7 @@ impl Route {
             header_matches,
             upstream: cfg.upstream.clone(),
             total_timeout: cfg.timeouts.total.into(),
+            read_timeout: cfg.timeouts.read.into(),
         }
     }
 }
@@ -433,7 +439,10 @@ impl Dispatch {
     /// the named upstream's forward path. Returns the upstream
     /// response on success, or a [`DispatchError`] on routing /
     /// forwarding failures.
-    pub async fn handle<B>(&self, req: Request<B>) -> Result<Response<Incoming>, DispatchError>
+    pub async fn handle<B>(
+        &self,
+        req: Request<B>,
+    ) -> Result<Response<conduit_upstream::TimedBody<Incoming>>, DispatchError>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -447,9 +456,10 @@ impl Dispatch {
         // borrows alive only as long as the route table needs them.
         //
         // `upstream` is cloned (refcount bump on the Arc-shared
-        // Client + Vec<Breaker>) and `total` is `Copy`, so we can
-        // hand both off and let the borrows die at end of block.
-        let (upstream, total) = {
+        // Client + Vec<Breaker>) and the timeout fields are `Copy`,
+        // so we can hand them off and let the borrows die at the
+        // end of the block.
+        let (upstream, total, read) = {
             let host = req.headers().get(HOST).and_then(|v| v.to_str().ok());
             let path = req.uri().path();
             let headers = req.headers();
@@ -466,10 +476,10 @@ impl Dispatch {
                 .ok_or_else(|| DispatchError::UpstreamNotRegistered {
                     name: route.upstream.clone(),
                 })?;
-            (upstream, route.total_timeout)
+            (upstream, route.total_timeout, route.read_timeout)
         };
 
-        match tokio::time::timeout(total, upstream.forward(req)).await {
+        match tokio::time::timeout(total, upstream.forward(req, read)).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => Err(DispatchError::Upstream(e)),
             Err(_) => Err(DispatchError::Timeout(total)),
@@ -519,6 +529,7 @@ mod tests {
             // give them a tame default so timeout-unaware tests don't
             // accidentally fire it.
             total_timeout: std::time::Duration::from_secs(30),
+            read_timeout: std::time::Duration::from_secs(30),
         }
     }
 

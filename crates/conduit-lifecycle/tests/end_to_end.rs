@@ -138,16 +138,12 @@ async fn full_ingress_to_upstream_round_trip() {
                 *req.uri_mut() = new_uri;
                 let resp = match dispatch.handle(req).await {
                     Ok(r) => {
-                        // Convert hyper::body::Incoming → BoxBody for
-                        // serialisation. The map_err coerces hyper's
-                        // body error into the boxed error type.
+                        // Convert TimedBody<Incoming> → BoxBody for
+                        // serialisation. TimedBody's Error type is
+                        // already the expected boxed-error shape, so
+                        // we can box without a map_err wrapper.
                         let (parts, body) = r.into_parts();
-                        let body: conduit_proto::BoxBody = http_body_util::BodyExt::boxed(
-                            http_body_util::BodyExt::map_err(body, |e| {
-                                let b: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
-                                b
-                            }),
-                        );
+                        let body: conduit_proto::BoxBody = http_body_util::BodyExt::boxed(body);
                         Ok::<_, Infallible>(Response::from_parts(parts, body))
                     }
                     Err(e) => {

@@ -130,7 +130,12 @@ async fn forward_happy_path() {
         mock_upstream_response(stream, &http_response(200, "OK", "hello upstream")).await;
     };
 
-    let client = async { upstream.forward(req).await.expect("forward") };
+    let client = async {
+        upstream
+            .forward(req, std::time::Duration::from_secs(30))
+            .await
+            .expect("forward")
+    };
 
     let ((), resp) = tokio::join!(server, client);
     assert_eq!(resp.status(), http::StatusCode::OK);
@@ -176,7 +181,11 @@ async fn forward_retries_on_502_then_succeeds() {
         }
     };
 
-    let client = async { upstream.forward(req).await };
+    let client = async {
+        upstream
+            .forward(req, std::time::Duration::from_secs(30))
+            .await
+    };
 
     let ((), result) = tokio::join!(server, client);
     let resp = result.expect("forward");
@@ -216,7 +225,11 @@ async fn forward_retries_exhausted() {
         }
     };
 
-    let client = async { upstream.forward(req).await };
+    let client = async {
+        upstream
+            .forward(req, std::time::Duration::from_secs(30))
+            .await
+    };
 
     let ((), result) = tokio::join!(server, client);
     // Design choice: when retries are exhausted on a retry-eligible
@@ -256,7 +269,12 @@ async fn h2_ingress_translates_to_h1_egress() {
         let (stream, _peer) = listener.accept().await.expect("accept");
         mock_upstream_capture(stream, &http_response(200, "OK", "ok")).await
     };
-    let client = async { upstream.forward(req).await.expect("forward") };
+    let client = async {
+        upstream
+            .forward(req, std::time::Duration::from_secs(30))
+            .await
+            .expect("forward")
+    };
 
     let (request_bytes, resp) = tokio::join!(server, client);
     assert_eq!(resp.status(), http::StatusCode::OK);
@@ -308,17 +326,26 @@ async fn breaker_opens_after_consecutive_connect_failures() {
     };
 
     // First attempt: real connect failure.
-    match upstream.forward(req()).await {
+    match upstream
+        .forward(req(), std::time::Duration::from_secs(30))
+        .await
+    {
         Err(ForwardError::Client { connect_error, .. }) => assert!(connect_error),
         other => panic!("expected Client connect-error, got {other:?}"),
     }
     // Second attempt: trips the breaker (now at threshold).
-    match upstream.forward(req()).await {
+    match upstream
+        .forward(req(), std::time::Duration::from_secs(30))
+        .await
+    {
         Err(ForwardError::Client { connect_error, .. }) => assert!(connect_error),
         other => panic!("expected Client connect-error, got {other:?}"),
     }
     // Third attempt: breaker is open, no connection attempted.
-    match upstream.forward(req()).await {
+    match upstream
+        .forward(req(), std::time::Duration::from_secs(30))
+        .await
+    {
         Err(ForwardError::BreakerOpen) => {}
         other => panic!("expected BreakerOpen, got {other:?}"),
     }

@@ -30,10 +30,12 @@
 mod breaker;
 mod health;
 mod retry;
+mod timed;
 
 pub use breaker::{Breaker, BreakerConfig, BreakerState, Decision as BreakerDecision};
 pub use health::{Probe, ProbeConfig};
 pub use retry::{RetryDecision, RetryPolicy};
+pub use timed::{ReadTimeout, TimedBody};
 
 use std::time::Duration;
 
@@ -527,7 +529,8 @@ impl Upstream {
     pub async fn forward<B>(
         &self,
         req: Request<B>,
-    ) -> Result<Response<hyper::body::Incoming>, ForwardError>
+        read_timeout: std::time::Duration,
+    ) -> Result<Response<TimedBody<hyper::body::Incoming>>, ForwardError>
     where
         B: BodyBytes + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -640,7 +643,14 @@ impl Upstream {
                             // up but not serving. 2xx/3xx/4xx all reset
                             // the breaker.
                             self.observe_breaker_outcome(addr_idx, !last_status.is_server_error());
-                            return Ok(resp);
+                            // Wrap the upstream's body with a per-frame
+                            // read deadline. A slow / silent backend
+                            // can't tie up a conduit connection past
+                            // `read_timeout` regardless of the total
+                            // route budget.
+                            let (parts, body) = resp.into_parts();
+                            let body = TimedBody::new(body, read_timeout);
+                            return Ok(Response::from_parts(parts, body));
                         }
                         RetryDecision::Retry => {
                             tracing::debug!(

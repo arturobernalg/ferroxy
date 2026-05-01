@@ -61,7 +61,7 @@ pub async fn serve_connection<F, Fut, B>(
 where
     F: Fn(Request<Bytes>) -> Fut + Send + Sync + 'static + Clone,
     Fut: std::future::Future<Output = Result<Response<B>, Infallible>> + Send + 'static,
-    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
 {
     let h3_conn = h3_quinn::Connection::new(conn);
@@ -98,7 +98,7 @@ async fn drive_request<F, Fut, B>(
 where
     F: Fn(Request<Bytes>) -> Fut,
     Fut: std::future::Future<Output = Result<Response<B>, Infallible>>,
-    B: Body<Data = Bytes> + Unpin,
+    B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
 {
     let (req_head, mut body_stream) = resolver.resolve_request().await.map_err(
@@ -125,7 +125,7 @@ where
     let req = Request::from_parts(req_parts, Bytes::from(buf));
 
     let resp = handler(req).await.unwrap_or_else(|never| match never {});
-    let (resp_parts, mut resp_body) = resp.into_parts();
+    let (resp_parts, resp_body) = resp.into_parts();
     let head: Response<()> = Response::from_parts(resp_parts, ());
     body_stream.send_response(head).await.map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(IoStr(e.to_string())) },
@@ -134,11 +134,14 @@ where
     // Stream the response body. `Body::frame` yields one frame at a
     // time; we forward data frames as `send_data` and drop non-data
     // frames (trailers don't appear in conduit's response bodies
-    // today — our BoxBody is built from VecBody / hyper Incoming,
-    // neither of which emits trailers).
-    while let Some(frame) =
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut resp_body).poll_frame(cx)).await
-    {
+    // today — our boxes are built from VecBody / hyper Incoming +
+    // TimedBody wrappers, none of which emit trailers).
+    //
+    // Stack-pin the body so we don't require `B: Unpin`. Caller
+    // bodies that contain a !Unpin field (e.g. `TimedBody`'s inner
+    // `Sleep`) work without an extra `Box::pin` allocation.
+    let mut resp_body = std::pin::pin!(resp_body);
+    while let Some(frame) = std::future::poll_fn(|cx| resp_body.as_mut().poll_frame(cx)).await {
         let frame = frame.map_err(Into::into)?;
         if let Ok(data) = frame.into_data() {
             body_stream.send_data(data).await.map_err(

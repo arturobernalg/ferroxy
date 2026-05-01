@@ -237,7 +237,10 @@ where
             // Wrap the upstream's body in our concrete enum instead
             // of allocating a Box<dyn Body>. Saves one heap
             // allocation per request on the success path.
-            Ok(Response::from_parts(parts, ProxyBody::Upstream(body)))
+            Ok(Response::from_parts(
+                parts,
+                ProxyBody::Upstream { inner: body },
+            ))
         }
         Err(conduit_lifecycle::DispatchError::NoRoute) => {
             tracing::debug!("no route matched");
@@ -301,25 +304,36 @@ fn error_response(status: StatusCode, body: &'static str) -> Response<ProxyBody>
     Response::builder()
         .status(status)
         .header("content-type", "text/plain")
-        .body(ProxyBody::Synthetic(VecBody::from_bytes(
-            Bytes::from_static(body.as_bytes()),
-        )))
+        .body(ProxyBody::Synthetic {
+            inner: VecBody::from_bytes(Bytes::from_static(body.as_bytes())),
+        })
         .expect("build error response")
 }
 
-/// Body returned by [`proxy_one`]. Concrete enum (not `BoxBody`) so
-/// the per-request happy path doesn't pay for a `Box<dyn Body>`
-/// allocation. Two variants cover every shape conduit produces:
-///
-/// - `Upstream` — bytes streamed back from the real backend.
-/// - `Synthetic` — error pages or admin replies built in-memory.
-///
-/// `Self::Error` is `BoxError` so callers don't have to thread the
-/// hyper error type. `Synthetic`'s body is `Infallible` and is
-/// promoted into `BoxError` at the match site (a never-taken arm).
-enum ProxyBody {
-    Upstream(Incoming),
-    Synthetic(VecBody),
+pin_project_lite::pin_project! {
+    /// Body returned by [`proxy_one`]. Concrete enum (not `BoxBody`)
+    /// so the per-request happy path doesn't pay for a
+    /// `Box<dyn Body>` allocation. Two variants cover every shape
+    /// conduit produces:
+    ///
+    /// - `Upstream` — bytes streamed back from the real backend,
+    ///   wrapped in a per-frame read-timeout enforcer
+    ///   (`conduit_upstream::TimedBody`).
+    /// - `Synthetic` — error pages or admin replies built in-memory.
+    ///
+    /// `pin_project_lite` is required because `TimedBody` is `!Unpin`
+    /// (its inner `tokio::time::Sleep` is `!Unpin`); the projection
+    /// macro lets us forward pin access without unsafe.
+    #[project = ProxyBodyProj]
+    enum ProxyBody {
+        Upstream {
+            #[pin]
+            inner: conduit_upstream::TimedBody<Incoming>,
+        },
+        Synthetic {
+            inner: VecBody,
+        },
+    }
 }
 
 impl http_body::Body for ProxyBody {
@@ -330,13 +344,12 @@ impl http_body::Body for ProxyBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
-        // SAFETY-equivalent: `get_mut` requires `Self: Unpin`. Both
-        // `Incoming` and `VecBody` are `Unpin`, so this enum is too.
-        match self.get_mut() {
-            ProxyBody::Upstream(b) => std::pin::Pin::new(b)
-                .poll_frame(cx)
-                .map(|opt| opt.map(|r| r.map_err(|e| Box::new(e) as _))),
-            ProxyBody::Synthetic(b) => std::pin::Pin::new(b)
+        match self.project() {
+            ProxyBodyProj::Upstream { inner } => {
+                // TimedBody::Error is already Box<dyn Error+Send+Sync>.
+                inner.poll_frame(cx)
+            }
+            ProxyBodyProj::Synthetic { inner } => std::pin::Pin::new(inner)
                 .poll_frame(cx)
                 .map(|opt| opt.map(|r| r.map_err(|never| match never {}))),
         }
@@ -344,15 +357,15 @@ impl http_body::Body for ProxyBody {
 
     fn is_end_stream(&self) -> bool {
         match self {
-            ProxyBody::Upstream(b) => b.is_end_stream(),
-            ProxyBody::Synthetic(b) => b.is_end_stream(),
+            ProxyBody::Upstream { inner } => inner.is_end_stream(),
+            ProxyBody::Synthetic { inner } => inner.is_end_stream(),
         }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
         match self {
-            ProxyBody::Upstream(b) => b.size_hint(),
-            ProxyBody::Synthetic(b) => b.size_hint(),
+            ProxyBody::Upstream { inner } => inner.size_hint(),
+            ProxyBody::Synthetic { inner } => inner.size_hint(),
         }
     }
 }

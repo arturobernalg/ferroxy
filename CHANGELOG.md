@@ -153,6 +153,29 @@ each independently small but stacking up. See
   URI rewrites just clone (refcount bump on the inner `Bytes`)
   instead of running `addr.to_string()` + parse on every call.
 
+### Per-leg read timeout (`TimedBody`)
+
+`Upstream::forward` now wraps the upstream's response body with
+`TimedBody` — a per-frame read deadline derived from
+`[[route]] timeouts.read`. A slow / silent backend can no longer
+tie up a conduit connection past the configured deadline regardless
+of the total route budget.
+
+Plumbed end-to-end:
+- `Route` carries `read_timeout: Duration` from
+  `cfg.timeouts.read.into()`.
+- `Dispatch::handle` returns `Response<TimedBody<Incoming>>`.
+- `ProxyBody::Upstream` now stores `TimedBody<Incoming>` and uses
+  `pin_project_lite` to forward pin access (TimedBody's inner
+  `tokio::time::Sleep` is `!Unpin`).
+- `conduit_h3::serve_connection` dropped its `B: Unpin` bound and
+  stack-pins the response body so non-`Unpin` body types work
+  without an extra `Box::pin` allocation.
+
+Tests: `timer_fires_when_inner_stalls` (50ms timeout against a
+forever-pending body returns `ReadTimeout`) and `ends_cleanly_on_eos`
+(a Full body completes without firing the timer).
+
 ### Build / quality / docs
 - Workspace-wide quality gate: `cargo build --workspace --all-targets
   --release`, `cargo test`, `cargo clippy -- -D warnings`,
@@ -181,7 +204,8 @@ These items are charter scope but not yet shipped. Each is tracked
 in the project's `phaseN_deviations` notes:
 
 - **Streaming bodies** for the upstream client and H3 ingress (P8.x / P9.x).
-- **Per-leg read/write timeouts** beyond the connect timeout (P5.x.x).
+- **Per-leg write timeout** to bound a slow upstream send (P5.x.x.x).
+  The read leg ✓ shipped via `TimedBody`.
 - **OCSP stapling**, session-ID cache, certificate hot-reload (P6.x.x).
 - **0-RTT for QUIC** (P9.x).
 - **`h2spec` / `qlog` CI gates** (P7.x / P9.x).
