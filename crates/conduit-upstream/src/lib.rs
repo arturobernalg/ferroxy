@@ -558,11 +558,20 @@ impl Upstream {
             }
         };
 
-        let bytes = body
-            .collect()
-            .await
-            .map_err(|e| ForwardError::Body(e.into()))?
-            .to_bytes();
+        // Skip body buffering when we *know* the body is empty
+        // (the common GET / HEAD case — no Content-Length, no
+        // chunked). `body.size_hint().exact() == Some(0)` is the
+        // unambiguous signal: any body type that knows its size and
+        // reports zero. Chunked / unknown-size bodies fall through
+        // to the buffered-collect path so retry replay still works.
+        let bytes = if body.size_hint().exact() == Some(0) {
+            Bytes::new()
+        } else {
+            body.collect()
+                .await
+                .map_err(|e| ForwardError::Body(e.into()))?
+                .to_bytes()
+        };
 
         // Hot-path optimisation: the default retry policy is
         // `attempts = 1` (no retry), in which case the loop runs once
