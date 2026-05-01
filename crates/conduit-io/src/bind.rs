@@ -14,6 +14,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 /// load balancing across all binders on the same `(addr, port)`). On
 /// non-Unix targets this is a hard error since the engineering charter
 /// targets Linux 6.6+.
+//
+// Used by the monoio backend; the tokio stub backend in Phase 1 does
+// not call it. Phase 11's full tokio implementation will.
+#[allow(dead_code)]
 pub(crate) fn bind(
     addr: SocketAddr,
     backlog: u32,

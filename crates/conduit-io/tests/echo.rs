@@ -1,6 +1,10 @@
 //! Phase 1 acceptance: TCP echo with concurrent connections, clean
 //! shutdown drains in flight.
 //!
+//! Linux-only — exercises the monoio backend directly. The macOS dev
+//! path uses the tokio stub backend, which has no live workers to
+//! drive a wire-traffic test against.
+//!
 //! Default N = 1000 (CI-friendly). `CONDUIT_IO_LARGE=1` raises to 10 000
 //! per the engineering charter target. 10k requires `ulimit -n` ≥ ~25k
 //! on the test host (each connection consumes 2 fds).
@@ -10,6 +14,8 @@
 //! the 20-byte test payload over loopback (arrives in one TCP segment).
 //! For larger payloads or remote tests we'd need a loop, but P1 is about
 //! the worker-model + drain invariants, not bytes-on-the-wire fidelity.
+
+#![cfg(all(target_os = "linux", not(feature = "runtime-tokio")))]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;

@@ -28,8 +28,8 @@ What Conduit is **not**:
 - **Not a Web server.** It does not serve files, render templates, or run scripts.
 - **Not a cache.** Response caching is out of scope for v1.
 - **Not a module platform.** There is no plug-in API; behaviour is configured, not loaded.
-- **Not portable.** Production targets are Linux 6.6+ on x86_64. Other platforms may build but
-  are unsupported.
+- **Not portable.** Production targets are Linux 6.6+ on x86_64 and aarch64. Other platforms
+  may build but are unsupported.
 
 ## Status
 
@@ -37,6 +37,42 @@ Pre-1.0. Active development. Each phase of the build plan ships only after the f
 is green; the [Roadmap](#roadmap) below reflects actual state, not aspiration. The binary
 currently loads and validates a configuration and accepts plain TCP connections via the io
 layer; it cannot yet serve HTTP traffic.
+
+## Supported Platforms
+
+Conduit is a Linux-first project. Production deployments are supported on Linux only. Other
+operating systems are supported for development.
+
+### Production
+
+Release binaries are published for:
+
+| Target                      | Notes                |
+|-----------------------------|----------------------|
+| `x86_64-unknown-linux-gnu`  | glibc, most distros  |
+| `x86_64-unknown-linux-musl` | static, Alpine       |
+| `aarch64-unknown-linux-gnu` | glibc, ARM64         |
+| `aarch64-unknown-linux-musl`| static, ARM64        |
+
+A multi-arch Docker image (`linux/amd64`, `linux/arm64`) is also published.
+
+### Development
+
+The `runtime-tokio` cargo feature provides a portable backend that builds and runs on macOS for
+local development. Tests pass in CI on macOS. Performance characteristics on macOS differ from
+Linux production; benchmark results in [`BENCHMARKS.md`](./BENCHMARKS.md) apply to Linux only.
+
+```bash
+# On macOS, the tokio backend is auto-selected:
+cargo build
+# To force the tokio backend on Linux (e.g. for comparison benchmarks):
+cargo build --features runtime-tokio
+```
+
+### Not Supported
+
+Windows is not a supported target. Conduit may or may not build on Windows; if it does, it is
+not tested and not recommended for any use.
 
 ## Features
 
