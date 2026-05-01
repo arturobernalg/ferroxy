@@ -139,6 +139,12 @@ each independently small but stacking up. See
   to non-cumulative — each observation bumps exactly one bucket.
   Cumulative sums computed at scrape time. Per-request atomic ops
   on the histogram path: ~24 → 2.
+- **`ProxyBody` enum** replaces the per-request `BoxBody`
+  allocation in the binary. Two variants (`Upstream(Incoming)`,
+  `Synthetic(VecBody)`) cover every body the proxy produces; the
+  compiler can inline through the enum dispatch and branch
+  prediction sees one variant per response so the cost is ~free.
+  One `Box<dyn Body>` heap allocation eliminated per request.
 
 ### Build / quality / docs
 - Workspace-wide quality gate: `cargo build --workspace --all-targets
