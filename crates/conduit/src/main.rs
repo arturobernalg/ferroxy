@@ -118,27 +118,33 @@ fn main() -> ExitCode {
         Arc::clone(&reload_done),
     );
 
+    // Single shared metrics sink. Every per-request handler bumps
+    // counters on it via `fetch_add(_, Relaxed)`; the admin server
+    // reads it on every `/metrics` scrape. Charter rule: no Mutex.
+    let metrics = Arc::new(conduit_control::MetricsHandle::new());
+
     // Spawn HTTPS listener if `[tls]` and `listen_https` are both
     // configured. The HTTPS listener runs on its own tokio runtime
     // thread so its TLS handshake cost does not interfere with the
     // plaintext data-plane runtime under load.
-    let https_thread = spawn_https_thread(&cfg, &dispatch);
+    let https_thread = spawn_https_thread(&cfg, &dispatch, &metrics);
 
     // Spawn HTTP/3 (QUIC) listener if `[tls]` and `listen_h3` are both
     // configured. Like HTTPS this runs on its own tokio runtime thread.
-    let h3_thread = spawn_h3_thread(&cfg, &dispatch);
+    let h3_thread = spawn_h3_thread(&cfg, &dispatch, &metrics);
 
     // Spawn the admin endpoint server on its own tokio runtime
     // thread. Sharing the data-plane runtime would couple admin
     // latency to data-plane scheduling pressure under load.
     let admin_addr = cfg.server.admin_listen;
     let admin_cancel = Arc::new(AtomicBool::new(false));
-    let admin_thread = spawn_admin_thread(admin_addr, Arc::clone(&admin_cancel));
+    let admin_thread =
+        spawn_admin_thread(admin_addr, Arc::clone(&admin_cancel), Arc::clone(&metrics));
 
     let server = if cfg.server.listen_http.is_empty() {
         None
     } else {
-        match start_http_server(spec, Arc::clone(&dispatch)) {
+        match start_http_server(spec, Arc::clone(&dispatch), Arc::clone(&metrics)) {
             Ok(s) => Some(s),
             Err(e) => {
                 tracing::error!(error = %e, "bind failed");
@@ -199,14 +205,17 @@ fn main() -> ExitCode {
 /// well-formed reply.
 async fn proxy_one<B>(
     dispatch: &Dispatch,
+    metrics: &conduit_control::MetricsHandle,
     req: http::Request<B>,
 ) -> Result<Response<conduit_proto::BoxBody>, Infallible>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    metrics.observe_request_start();
     match dispatch.handle(req).await {
         Ok(resp) => {
+            metrics.observe_status(resp.status().as_u16());
             let (parts, body) = resp.into_parts();
             // Erase hyper::body::Incoming → BoxBody so the binary
             // returns one concrete body type regardless of which
@@ -221,6 +230,8 @@ where
         }
         Err(conduit_lifecycle::DispatchError::NoRoute) => {
             tracing::debug!("no route matched");
+            metrics.observe_no_route();
+            metrics.observe_status(404);
             Ok(error_response(
                 StatusCode::NOT_FOUND,
                 "conduit: no route matched\n",
@@ -228,6 +239,8 @@ where
         }
         Err(conduit_lifecycle::DispatchError::UpstreamNotRegistered { name }) => {
             tracing::error!(upstream = %name, "route references unknown upstream");
+            metrics.observe_upstream_unknown();
+            metrics.observe_status(500);
             Ok(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "conduit: route references unknown upstream\n",
@@ -235,6 +248,8 @@ where
         }
         Err(conduit_lifecycle::DispatchError::Upstream(e)) => {
             tracing::warn!(error = ?e, "upstream forward failed");
+            metrics.observe_upstream_failed();
+            metrics.observe_status(502);
             Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 "conduit: upstream unavailable\n",
@@ -245,6 +260,7 @@ where
             // (e.g. P5.x's filter-rejection) compile here without
             // editing this match. They get a generic 500.
             tracing::error!(error = ?other, "dispatch error");
+            metrics.observe_status(500);
             Ok(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "conduit: dispatch error\n",
@@ -269,16 +285,20 @@ fn error_response(status: StatusCode, body: &'static str) -> Response<conduit_pr
 fn start_http_server(
     spec: ServeSpec,
     dispatch: DispatchSwap,
+    metrics: Arc<conduit_control::MetricsHandle>,
 ) -> Result<conduit_io::Server, conduit_io::BindError> {
     let server = serve(spec, move || {
         let dispatch = Arc::clone(&dispatch);
+        let metrics = Arc::clone(&metrics);
         move |stream: conduit_io::TcpStream, peer: std::net::SocketAddr| {
             let dispatch = Arc::clone(&dispatch);
+            let metrics = Arc::clone(&metrics);
             async move {
                 tracing::debug!(?peer, "accepted connection");
                 let handler = move |req: http::Request<Incoming>| {
                     let dispatch = dispatch.load_full();
-                    async move { proxy_one(&dispatch, req).await }
+                    let metrics = Arc::clone(&metrics);
+                    async move { proxy_one(&dispatch, &metrics, req).await }
                 };
                 if let Err(e) = conduit_h1::serve_connection(stream, handler).await {
                     tracing::warn!(?peer, error = %e, "connection ended with error");
@@ -297,6 +317,7 @@ fn start_http_server(
 fn spawn_https_thread(
     cfg: &conduit_config::Config,
     dispatch: &DispatchSwap,
+    metrics: &Arc<conduit_control::MetricsHandle>,
 ) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
     if cfg.server.listen_https.is_empty() {
         return None;
@@ -317,12 +338,13 @@ fn spawn_https_thread(
     };
     let acceptor = conduit_transport::build_acceptor(server_cfg);
     let dispatch_clone = Arc::clone(dispatch);
+    let metrics_clone = Arc::clone(metrics);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_clone = Arc::clone(&cancel);
     let addrs = cfg.server.listen_https.clone();
     let handle = std::thread::Builder::new()
         .name("conduit-https-rt".into())
-        .spawn(move || run_https(addrs, acceptor, dispatch_clone, cancel_clone))
+        .spawn(move || run_https(addrs, acceptor, dispatch_clone, metrics_clone, cancel_clone))
         .expect("spawn https thread");
     Some((handle, cancel))
 }
@@ -336,6 +358,7 @@ fn spawn_https_thread(
 fn spawn_admin_thread(
     addr: std::net::SocketAddr,
     cancel: Arc<AtomicBool>,
+    metrics: Arc<conduit_control::MetricsHandle>,
 ) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("conduit-admin-rt".into())
@@ -351,7 +374,7 @@ fn spawn_admin_thread(
                 }
             };
             rt.block_on(async move {
-                if let Err(e) = conduit_control::serve_admin(addr, cancel).await {
+                if let Err(e) = conduit_control::serve_admin(addr, cancel, metrics).await {
                     tracing::error!(error = %e, "admin server failed");
                 }
             });
@@ -417,6 +440,7 @@ fn run_https(
     addrs: Vec<std::net::SocketAddr>,
     acceptor: conduit_transport::TlsAcceptor,
     dispatch: DispatchSwap,
+    metrics: Arc<conduit_control::MetricsHandle>,
     cancel: Arc<AtomicBool>,
 ) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -453,6 +477,7 @@ fn run_https(
         for listener in listeners {
             let acceptor = acceptor.clone();
             let dispatch = Arc::clone(&dispatch);
+            let metrics = Arc::clone(&metrics);
             let cancel = Arc::clone(&cancel);
             tasks.push(tokio::spawn(async move {
                 while !cancel.load(Ordering::Acquire) {
@@ -469,6 +494,7 @@ fn run_https(
                     };
                     let acceptor = acceptor.clone();
                     let dispatch = Arc::clone(&dispatch);
+                    let metrics = Arc::clone(&metrics);
                     tokio::spawn(async move {
                         let tls = match conduit_transport::accept_tls(&acceptor, stream).await {
                             Ok(s) => s,
@@ -484,7 +510,8 @@ fn run_https(
                         let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
                         let handler = move |req: http::Request<Incoming>| {
                             let dispatch = dispatch.load_full();
-                            async move { proxy_one(&dispatch, req).await }
+                            let metrics = Arc::clone(&metrics);
+                            async move { proxy_one(&dispatch, &metrics, req).await }
                         };
                         match alpn.as_deref() {
                             Some(b"h2") => {
@@ -635,6 +662,7 @@ fn join_aux_threads(
 fn spawn_h3_thread(
     cfg: &conduit_config::Config,
     dispatch: &DispatchSwap,
+    metrics: &Arc<conduit_control::MetricsHandle>,
 ) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
     if cfg.server.listen_h3.is_empty() {
         return None;
@@ -667,12 +695,13 @@ fn spawn_h3_thread(
     };
 
     let dispatch_clone = Arc::clone(dispatch);
+    let metrics_clone = Arc::clone(metrics);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_clone = Arc::clone(&cancel);
     let addrs = cfg.server.listen_h3.clone();
     let handle = std::thread::Builder::new()
         .name("conduit-h3-rt".into())
-        .spawn(move || run_h3(addrs, quic_cfg, dispatch_clone, cancel_clone))
+        .spawn(move || run_h3(addrs, quic_cfg, dispatch_clone, metrics_clone, cancel_clone))
         .expect("spawn h3 thread");
     Some((handle, cancel))
 }
@@ -686,6 +715,7 @@ fn run_h3(
     addrs: Vec<std::net::SocketAddr>,
     quic_cfg: quinn::ServerConfig,
     dispatch: DispatchSwap,
+    metrics: Arc<conduit_control::MetricsHandle>,
     cancel: Arc<AtomicBool>,
 ) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -718,6 +748,7 @@ fn run_h3(
         let mut tasks = Vec::with_capacity(endpoints.len());
         for endpoint in endpoints {
             let dispatch = Arc::clone(&dispatch);
+            let metrics = Arc::clone(&metrics);
             let cancel = Arc::clone(&cancel);
             tasks.push(tokio::spawn(async move {
                 while !cancel.load(Ordering::Acquire) {
@@ -732,6 +763,7 @@ fn run_h3(
                         Err(_) => continue, // timeout → recheck cancel
                     };
                     let dispatch = Arc::clone(&dispatch);
+                    let metrics = Arc::clone(&metrics);
                     tokio::spawn(async move {
                         let conn = match connecting.await {
                             Ok(c) => c,
@@ -743,13 +775,14 @@ fn run_h3(
                         let peer = conn.remote_address();
                         let handler = move |req: http::Request<Bytes>| {
                             let dispatch = dispatch.load_full();
+                            let metrics = Arc::clone(&metrics);
                             async move {
                                 let (parts, body) = req.into_parts();
                                 let req = http::Request::from_parts(
                                     parts,
                                     http_body_util::Full::new(body),
                                 );
-                                proxy_one(&dispatch, req).await
+                                proxy_one(&dispatch, &metrics, req).await
                             }
                         };
                         if let Err(e) = conduit_h3::serve_connection(conn, handler).await {

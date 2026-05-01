@@ -1,5 +1,5 @@
-//! conduit-control — Layer 6: admin endpoints + (forthcoming) hot-reload,
-//! metrics, OpenTelemetry tracing, shutdown coordination.
+//! conduit-control — Layer 6: admin endpoints, metrics, hot-reload
+//! coordination, observability surfaces.
 //!
 //! # What this crate does today
 //!
@@ -9,29 +9,33 @@
 //!       process is up.
 //!     - `GET /ready` — readiness probe; 200 OK once the proxy has
 //!       finished startup. (Currently always ready since startup is
-//!       synchronous; will track upstream health in P10 proper.)
-//! - Cancellation: `serve_admin` accepts a future that resolves when
-//!   the caller wants to stop accepting; on completion it stops
-//!   accepting and returns. In-flight admin requests are short and
-//!   are not tracked.
+//!       synchronous; will track upstream health when active health
+//!       checks ship.)
+//!     - `GET /metrics` — Prometheus 0.0.4 text-format exposition.
+//!       The data-plane-fed counter family ([`MetricsHandle`]) lives
+//!       beside the synthetic `conduit_uptime_seconds` /
+//!       `conduit_build_info` gauges.
+//! - [`MetricsHandle`] — lock-free atomic counters fed by the data
+//!   plane (one shared `Arc<MetricsHandle>` across every per-request
+//!   handler). The admin server holds the same handle and reads it
+//!   on every `/metrics` scrape.
+//! - Cancellation: `serve_admin` accepts an `AtomicBool` flag the
+//!   caller flips on shutdown; the accept loop polls it between
+//!   accepts. In-flight admin requests are short and are not tracked.
 //!
 //! # What this crate does not do (yet)
 //!
-//! - SIGHUP-driven hot-reload of the config + atomic swap of the
-//!   live `Dispatch`.
 //! - `/config` (read-only effective TOML), `/pools` (live pool
-//!   stats), `/reload` (POST trigger).
-//! - Prometheus `/metrics` endpoint with histogram + counter family
-//!   per the engineering charter.
+//!   stats), `/reload` (POST-triggered reload). SIGHUP-triggered
+//!   reload is wired in the binary today; an HTTP trigger is P10.x.
+//! - Histogram families for request latency. Counters ship now;
+//!   histograms wait on a hdrhistogram-backed shared sink.
 //! - OpenTelemetry tracing wiring with W3C `traceparent` propagation.
-//!
-//! All of these are P10 deliverables; this crate stubs the surface
-//! and ships the two operational must-haves (`/health`, `/ready`) so
-//! the binary can pass kubernetes-style liveness/readiness probes
-//! today.
 
 #![deny(missing_docs)]
 
 mod admin;
+mod metrics;
 
 pub use admin::{serve_admin, AdminError};
+pub use metrics::MetricsHandle;

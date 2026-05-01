@@ -17,6 +17,8 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+use crate::metrics::MetricsHandle;
+
 /// Process start time, captured the first time the admin server is
 /// asked to render `/metrics`. Stored as `Option<Instant>` behind a
 /// `OnceLock` so unit tests that build responses without first
@@ -51,10 +53,12 @@ pub enum AdminError {
 /// observed). Returns `Ok(())` on clean shutdown, `Err(AdminError)`
 /// only on bind failure (every per-connection error is logged and
 /// otherwise discarded).
-pub async fn serve_admin(addr: SocketAddr, cancel: Arc<AtomicBool>) -> Result<(), AdminError> {
+pub async fn serve_admin(
+    addr: SocketAddr,
+    cancel: Arc<AtomicBool>,
+    metrics: Arc<MetricsHandle>,
+) -> Result<(), AdminError> {
     // Anchor the uptime gauge from the moment the admin server binds.
-    // P10's full set of metrics (counters fed by the data plane) lands
-    // when the data plane gets a shared metrics handle in P10.x.
     let _ = process_start();
     let listener = TcpListener::bind(addr)
         .await
@@ -68,10 +72,15 @@ pub async fn serve_admin(addr: SocketAddr, cancel: Arc<AtomicBool>) -> Result<()
         }
         match tokio::time::timeout(poll, listener.accept()).await {
             Ok(Ok((stream, peer))) => {
+                let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let metrics = Arc::clone(&metrics);
+                        async move { Ok::<_, Infallible>(handle(&req, &metrics)) }
+                    });
                     if let Err(e) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service_fn(handle))
+                        .serve_connection(io, svc)
                         .await
                     {
                         tracing::debug!(?peer, error = ?e, "admin connection ended with error");
@@ -89,27 +98,26 @@ pub async fn serve_admin(addr: SocketAddr, cancel: Arc<AtomicBool>) -> Result<()
     Ok(())
 }
 
-/// Per-request handler.
-async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    let resp = match (req.method(), req.uri().path()) {
+/// Per-request handler. Sync — every admin endpoint completes
+/// without awaiting; the async wrapper at the call site keeps the
+/// hyper `service_fn` signature happy.
+fn handle(req: &Request<Incoming>, metrics: &MetricsHandle) -> Response<Full<Bytes>> {
+    match (req.method(), req.uri().path()) {
         (&Method::GET, "/health") => plain_text(StatusCode::OK, "ok\n"),
         (&Method::GET, "/ready") => plain_text(StatusCode::OK, "ready\n"),
-        (&Method::GET, "/metrics") => metrics_response(),
+        (&Method::GET, "/metrics") => metrics_response(metrics),
         (&Method::GET, "/") => plain_text(
             StatusCode::OK,
             "conduit admin\nendpoints: /health /ready /metrics\n",
         ),
         _ => plain_text(StatusCode::NOT_FOUND, "not found\n"),
-    };
-    Ok(resp)
+    }
 }
 
-/// Render the Prometheus 0.0.4 text-format exposition for the
-/// metrics this build can produce *today* — which is just a uptime
-/// gauge and a `build_info` gauge with the package version. The full
-/// histogram + per-route counter family lands in P10.x once the
-/// data plane has a shared metrics handle.
-fn metrics_response() -> Response<Full<Bytes>> {
+/// Render the Prometheus 0.0.4 text-format exposition: synthetic
+/// uptime + `build_info` gauges concatenated with the data-plane-fed
+/// counter family from `MetricsHandle`.
+fn metrics_response(metrics: &MetricsHandle) -> Response<Full<Bytes>> {
     let uptime = process_start().elapsed().as_secs_f64();
     let version = env!("CARGO_PKG_VERSION");
     let body = format!(
@@ -118,7 +126,9 @@ fn metrics_response() -> Response<Full<Bytes>> {
          conduit_uptime_seconds {uptime}\n\
          # HELP conduit_build_info Build information; value is always 1.\n\
          # TYPE conduit_build_info gauge\n\
-         conduit_build_info{{version=\"{version}\"}} 1\n",
+         conduit_build_info{{version=\"{version}\"}} 1\n\
+         {data_plane}",
+        data_plane = metrics.render(),
     );
     Response::builder()
         .status(StatusCode::OK)
@@ -163,7 +173,10 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_renders_prometheus_exposition() {
-        let r = metrics_response();
+        let m = MetricsHandle::new();
+        m.observe_request_start();
+        m.observe_status(200);
+        let r = metrics_response(&m);
         assert_eq!(r.status(), StatusCode::OK);
         assert!(r
             .headers()
@@ -174,6 +187,9 @@ mod tests {
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("# TYPE conduit_uptime_seconds gauge"));
         assert!(text.contains("conduit_build_info{version=\""));
+        // Counter family is concatenated after the gauges.
+        assert!(text.contains("conduit_requests_total 1"));
+        assert!(text.contains("conduit_responses_total{class=\"2xx\"} 1"));
         // Uptime line shape: `conduit_uptime_seconds <number>\n`.
         let line = text
             .lines()
