@@ -1,19 +1,19 @@
-# Ferroxy
+# Conduit
 
 A correctness-first HTTP reverse proxy for Linux, written in Rust.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust: 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 <!-- Add once a release is published:
-[![Crates.io](https://img.shields.io/crates/v/ferroxy.svg)](https://crates.io/crates/ferroxy)
+[![Crates.io](https://img.shields.io/crates/v/conduit.svg)](https://crates.io/crates/conduit)
 -->
 <!-- Add once .github/workflows/ci.yml lands (Phase 12):
-[![CI](https://github.com/arturobernalg/ferroxy/actions/workflows/ci.yml/badge.svg)](https://github.com/arturobernalg/ferroxy/actions/workflows/ci.yml)
+[![CI](https://github.com/arturobernalg/conduit/actions/workflows/ci.yml/badge.svg)](https://github.com/arturobernalg/conduit/actions/workflows/ci.yml)
 -->
 
 ## Overview
 
-Ferroxy is an HTTP reverse proxy designed for the modern Linux server: thread-per-core,
+Conduit is an HTTP reverse proxy designed for the modern Linux server: thread-per-core,
 share-nothing, `io_uring`-based, with a strict layered architecture in which each crate owns
 exactly one concern. The code base is small on purpose — abstractions arrive only when they
 remove demonstrable complexity.
@@ -21,9 +21,9 @@ remove demonstrable complexity.
 The design thesis is that a proxy built from the kernel up against a fixed target workload, with
 hot-path discipline enforced at review time and dependency direction enforced at build time, can
 match the throughput and tail-latency floor of the established proxies on that workload while
-remaining auditable end-to-end. Ferroxy is the execution of that thesis.
+remaining auditable end-to-end. Conduit is the execution of that thesis.
 
-What Ferroxy is **not**:
+What Conduit is **not**:
 
 - **Not a Web server.** It does not serve files, render templates, or run scripts.
 - **Not a cache.** Response caching is out of scope for v1.
@@ -79,7 +79,7 @@ Items marked **(planned)** are part of the v1 plan but not yet implemented.
 
 ## Architecture
 
-Ferroxy is split into single-concern crates organised as a strict downward stack. Each crate may
+Conduit is split into single-concern crates organised as a strict downward stack. Each crate may
 depend only on the layers below it; the rule is enforced by `cargo deny check` via
 `[[bans.deny]]` entries in [`deny.toml`](./deny.toml). Cross-cutting concerns (tracing) are
 threaded through layers via explicit context, never thread-locals.
@@ -100,7 +100,7 @@ threaded through layers via explicit context, never thread-locals.
 +----------------------------------+
 ```
 
-The `ferroxy-proto` crate sits beside the protocol layer and exposes the single shared
+The `conduit-proto` crate sits beside the protocol layer and exposes the single shared
 request/response stream type that every protocol implementation maps to and that the lifecycle
 layer consumes; it is the one explicit abstraction that the project pays for. See
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design treatment (forthcoming).
@@ -109,19 +109,19 @@ layer consumes; it is the one explicit abstraction that the project pays for. Se
 
 ### Build from source
 
-Ferroxy targets Rust stable. The minimum supported Rust version is **1.75**.
+Conduit targets Rust stable. The minimum supported Rust version is **1.75**.
 
 ```bash
-git clone https://github.com/arturobernalg/ferroxy.git
-cd ferroxy
+git clone https://github.com/arturobernalg/conduit.git
+cd conduit
 cargo build --release
 ```
 
-The binary is produced at `target/release/ferroxy`.
+The binary is produced at `target/release/conduit`.
 
 ### Run with a minimal configuration
 
-Save the following to `ferroxy.toml`:
+Save the following to `conduit.toml`:
 
 ```toml
 [server]
@@ -143,13 +143,13 @@ upstream = "origin"
 Validate it without starting the runtime:
 
 ```bash
-ferroxy --config ferroxy.toml --check
+conduit --config conduit.toml --check
 ```
 
 Start it:
 
 ```bash
-ferroxy --config ferroxy.toml
+conduit --config conduit.toml
 ```
 
 ### Verify it works
@@ -160,12 +160,12 @@ With a backend listening on `127.0.0.1:9000` (e.g. `python3 -m http.server 9000`
 curl -i http://127.0.0.1:8080/
 ```
 
-> The HTTP forwarding path is implemented in Phase 3 (`ferroxy-h1`). Until that phase lands,
+> The HTTP forwarding path is implemented in Phase 3 (`conduit-h1`). Until that phase lands,
 > the binary accepts the TCP connection and closes it without speaking HTTP.
 
 ## Configuration
 
-Ferroxy is configured via a single TOML file. The schema is strictly validated at load: unknown
+Conduit is configured via a single TOML file. The schema is strictly validated at load: unknown
 keys are rejected, semantic constraints (route targets exist, certificate files exist, etc.) are
 checked before the runtime starts. A complete example with TLS, multiple routes, and health
 checks:
@@ -184,8 +184,8 @@ metrics_listen  = "127.0.0.1:9091"
 min_version = "1.3"
 alpn        = ["h2", "http/1.1"]
 certs = [
-    { sni = "api.example.com",   cert = "/etc/ferroxy/api.crt",      key = "/etc/ferroxy/api.key" },
-    { sni = "*.static.example.com", cert = "/etc/ferroxy/static.crt", key = "/etc/ferroxy/static.key" },
+    { sni = "api.example.com",   cert = "/etc/conduit/api.crt",      key = "/etc/conduit/api.key" },
+    { sni = "*.static.example.com", cert = "/etc/conduit/static.crt", key = "/etc/conduit/static.key" },
 ]
 
 [[upstream]]
@@ -214,12 +214,12 @@ match    = { host = "static.example.com", path_prefix = "/" }
 upstream = "static"
 ```
 
-The annotated reference example lives at [`examples/ferroxy.toml`](./examples/ferroxy.toml). The
+The annotated reference example lives at [`examples/conduit.toml`](./examples/conduit.toml). The
 full key-by-key reference will be published as [`CONFIG.md`](./CONFIG.md) (forthcoming).
 
 ## Performance
 
-Ferroxy is engineered against a fixed target workload, defined in the project charter and
+Conduit is engineered against a fixed target workload, defined in the project charter and
 reproducible from the benchmark harness:
 
 - Linux 6.6+, x86_64, 16 cores, 32 GB RAM, 25 Gbps NIC
@@ -270,7 +270,7 @@ cargo deny    check
 
 ```bash
 # Integration tests for a single crate
-cargo test -p ferroxy-io --test echo
+cargo test -p conduit-io --test echo
 
 # Fuzz target (lands in Phase 3 with the H1 parser)
 cargo fuzz run h1_parser -- -max_total_time=60
@@ -285,34 +285,34 @@ cargo criterion --workspace
 
 ### Done
 
-- **Phase 0** — Workspace skeleton, `ferroxy-config` (parse + validate), CLI, structured
+- **Phase 0** — Workspace skeleton, `conduit-config` (parse + validate), CLI, structured
   logging, dependency-direction lints in `deny.toml`.
 
 ### In progress
 
-- **Phase 1** — `ferroxy-io`: monoio listener, thread-per-core worker model with
+- **Phase 1** — `conduit-io`: monoio listener, thread-per-core worker model with
   `SO_REUSEPORT`, CPU pinning, `io_uring` (registered buffers deferred to a P1.x cleanup pass),
   graceful shutdown on `SIGTERM` / `SIGINT`.
 
 ### Planned (v1)
 
-- **Phase 2** — `ferroxy-proto`: shared request/response stream contract with property tests.
-- **Phase 3** — `ferroxy-h1`: parse, serialize, end-to-end forward to a mock upstream;
+- **Phase 2** — `conduit-proto`: shared request/response stream contract with property tests.
+- **Phase 3** — `conduit-h1`: parse, serialize, end-to-end forward to a mock upstream;
   per-request `bumpalo` arena.
-- **Phase 4** — `ferroxy-upstream` (h1): sharded per-worker pool, health checks, passive
+- **Phase 4** — `conduit-upstream` (h1): sharded per-worker pool, health checks, passive
   ejection, circuit breaker, retry.
-- **Phase 5** — `ferroxy-lifecycle`: prefix-trie route table built at config load, filter
+- **Phase 5** — `conduit-lifecycle`: prefix-trie route table built at config load, filter
   chain, timeout enforcement.
-- **Phase 6** — `ferroxy-transport`: TLS via `rustls` + `aws-lc-rs`, SNI, certificate
+- **Phase 6** — `conduit-transport`: TLS via `rustls` + `aws-lc-rs`, SNI, certificate
   hot-reload via `arc-swap`.
-- **Phase 7** — `ferroxy-h2`: server then client; `h2spec` 100% server-side; HPACK fuzz target.
+- **Phase 7** — `conduit-h2`: server then client; `h2spec` 100% server-side; HPACK fuzz target.
 - **Phase 8** — Protocol translation (H2 ingress → H1 egress) preserving trailers,
   cancellation, and back-pressure.
-- **Phase 9** — `ferroxy-h3`: QUIC + H3 with interop against `quiche` and `ngtcp2`; 0-RTT
+- **Phase 9** — `conduit-h3`: QUIC + H3 with interop against `quiche` and `ngtcp2`; 0-RTT
   off by default.
-- **Phase 10** — `ferroxy-control`: `SIGHUP` hot-reload, admin endpoints, full Prometheus
+- **Phase 10** — `conduit-control`: `SIGHUP` hot-reload, admin endpoints, full Prometheus
   metrics, OpenTelemetry tracing wiring.
-- **Phase 11** — Benchmark harness in `bench/`: `docker-compose` driving Ferroxy, nginx, and
+- **Phase 11** — Benchmark harness in `bench/`: `docker-compose` driving Conduit, nginx, and
   Pingora against four upstream servers under identical sysctls, worker counts, and cipher
   suites.
 - **Phase 11.5** — Profile against the target workload; identify the top five hot functions;
@@ -333,7 +333,7 @@ cargo criterion --workspace
 
 ## Contributing
 
-Contributions are welcome. Ferroxy is a serious project with a written engineering charter that
+Contributions are welcome. Conduit is a serious project with a written engineering charter that
 contributors are signing up for: one trait per real concept, no speculative generality, hot-path
 discipline (no per-request allocation, no `Arc<Mutex<…>>`, no async-fn boxing), and one concern
 per commit.
@@ -356,7 +356,7 @@ against the previous milestone (or a commit message explaining the win). See
 
 Please **do not file public GitHub issues for security vulnerabilities**.
 
-Report them via [GitHub's private vulnerability reporting](https://github.com/arturobernalg/ferroxy/security/advisories/new)
+Report them via [GitHub's private vulnerability reporting](https://github.com/arturobernalg/conduit/security/advisories/new)
 or by email to the project maintainer (address listed in the GitHub profile). A coordinated
 disclosure window will be agreed before any public discussion of the issue.
 
@@ -377,7 +377,7 @@ any additional terms or conditions.
 
 ## Acknowledgments
 
-Ferroxy's design draws on the engineering of several established projects:
+Conduit's design draws on the engineering of several established projects:
 
 - **nginx** — the reference for production-grade event-driven proxying.
 - **Pingora** — the existence proof that a Rust proxy can handle Cloudflare-scale traffic.

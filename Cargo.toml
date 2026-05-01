@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ferroxy",
-    "crates/ferroxy-config",
-    "crates/ferroxy-control",
-    "crates/ferroxy-h1",
-    "crates/ferroxy-h2",
-    "crates/ferroxy-h3",
-    "crates/ferroxy-io",
-    "crates/ferroxy-lifecycle",
-    "crates/ferroxy-proto",
-    "crates/ferroxy-transport",
-    "crates/ferroxy-upstream",
+    "crates/conduit",
+    "crates/conduit-config",
+    "crates/conduit-control",
+    "crates/conduit-h1",
+    "crates/conduit-h2",
+    "crates/conduit-h3",
+    "crates/conduit-io",
+    "crates/conduit-lifecycle",
+    "crates/conduit-proto",
+    "crates/conduit-transport",
+    "crates/conduit-upstream",
 ]
 
 [workspace.package]
@@ -19,7 +19,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/ferroxy"
+repository = "https://example.invalid/conduit"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -59,16 +59,16 @@ core_affinity = "0.8"
 signal-hook = "0.3"
 
 # internal
-ferroxy-config = { path = "crates/ferroxy-config", version = "0.1.0" }
-ferroxy-control = { path = "crates/ferroxy-control", version = "0.1.0" }
-ferroxy-h1 = { path = "crates/ferroxy-h1", version = "0.1.0" }
-ferroxy-h2 = { path = "crates/ferroxy-h2", version = "0.1.0" }
-ferroxy-h3 = { path = "crates/ferroxy-h3", version = "0.1.0" }
-ferroxy-io = { path = "crates/ferroxy-io", version = "0.1.0" }
-ferroxy-lifecycle = { path = "crates/ferroxy-lifecycle", version = "0.1.0" }
-ferroxy-proto = { path = "crates/ferroxy-proto", version = "0.1.0" }
-ferroxy-transport = { path = "crates/ferroxy-transport", version = "0.1.0" }
-ferroxy-upstream = { path = "crates/ferroxy-upstream", version = "0.1.0" }
+conduit-config = { path = "crates/conduit-config", version = "0.1.0" }
+conduit-control = { path = "crates/conduit-control", version = "0.1.0" }
+conduit-h1 = { path = "crates/conduit-h1", version = "0.1.0" }
+conduit-h2 = { path = "crates/conduit-h2", version = "0.1.0" }
+conduit-h3 = { path = "crates/conduit-h3", version = "0.1.0" }
+conduit-io = { path = "crates/conduit-io", version = "0.1.0" }
+conduit-lifecycle = { path = "crates/conduit-lifecycle", version = "0.1.0" }
+conduit-proto = { path = "crates/conduit-proto", version = "0.1.0" }
+conduit-transport = { path = "crates/conduit-transport", version = "0.1.0" }
+conduit-upstream = { path = "crates/conduit-upstream", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

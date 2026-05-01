@@ -1,0 +1,24 @@
+[package]
+name = "conduit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reverse proxy binary; wires every layer crate."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "conduit"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+signal-hook = { workspace = true }
+
+conduit-config = { workspace = true }
+conduit-io = { workspace = true }

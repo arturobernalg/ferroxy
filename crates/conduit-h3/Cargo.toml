@@ -1,0 +1,12 @@
+[package]
+name = "conduit-h3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Layer 3: HTTP/3 (RFC 9114) over QUIC, QPACK (RFC 9204)."
+
+[lints]
+workspace = true
+
+[dependencies]
