@@ -41,8 +41,7 @@ expect_used = "allow"
 unwrap_used = "allow"
 
 [workspace.dependencies]
-# Phase 0 only declares deps it actually uses. Runtime, io, transport,
-# and protocol deps land as their owning phase ships.
+# Phase 0 + Phase 1 deps. Each phase declares deps as it lands.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "2"
@@ -50,6 +49,14 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# P1 — io layer
+monoio = { version = "0.2", default-features = false, features = ["legacy", "iouring", "macros"] }
+socket2 = { version = "0.5", features = ["all"] }
+core_affinity = "0.8"
+# binary-only: signal handling. Cleaner than rolling sigaction by hand
+# and keeps `unsafe_code = "forbid"` everywhere else.
+signal-hook = "0.3"
 
 # internal
 ferroxy-config = { path = "crates/ferroxy-config", version = "0.1.0" }

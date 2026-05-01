@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Layer 1: listeners, accept loop, worker model, buffer pool."
+description = "Layer 1: monoio listeners, accept loop, thread-per-core worker model, buffer pool."
 
 [lints]
 workspace = true
 
 [dependencies]
+monoio = { workspace = true }
+socket2 = { workspace = true }
+core_affinity = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

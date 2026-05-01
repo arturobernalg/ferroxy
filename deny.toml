@@ -13,7 +13,10 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# RUSTSEC-2025-0057: fxhash is unmaintained; pulled in transitively
+# through monoio. No security CVE — informational only. Track until
+# monoio switches to rustc-hash (or another active hasher).
+ignore = ["RUSTSEC-2025-0057"]
 
 [licenses]
 version = 2
