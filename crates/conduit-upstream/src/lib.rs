@@ -170,6 +170,22 @@ impl Upstream {
         // negligible.
         let (mut parts, body) = req.into_parts();
 
+        // Translate to HTTP/1.1 for egress regardless of how the
+        // request arrived. hyper-util's H1 pool sends HTTP/1.1; an
+        // H2 ingress request whose version is still `HTTP/2.0` would
+        // confuse hyper at serialization time. P8 charter goal: H2
+        // ingress → H1 egress is the production reverse-proxy path.
+        // H2 hop-by-hop headers (`te`, `connection`, etc.) are
+        // already stripped by hyper's H2 server on the way in, so we
+        // do not re-strip them here.
+        parts.version = http::Version::HTTP_11;
+        // Strip the inbound `host` header so hyper-util's H1 client
+        // can derive Host from the rewritten URI authority below.
+        // H2 ingress never sends a `host` header (it uses :authority,
+        // which hyper turns into the URI), so this is a no-op for H2;
+        // for H1 ingress it ensures a consistent Host across retries.
+        parts.headers.remove(http::header::HOST);
+
         // Rewrite the URI to an absolute http:// URL pointing at the
         // backend chosen by our load balancer (round-robin today).
         if let Some(addr) = self.pick_addr() {
