@@ -225,6 +225,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "conduit-config",
+ "conduit-h1",
  "conduit-proto",
  "conduit-upstream",
  "http",

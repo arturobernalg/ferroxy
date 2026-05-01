@@ -108,11 +108,15 @@ wrappers = [
     "conduit",
 ]
 
-# Layer 3 — h1: only the upstream pool (client) and the binary use it
+# Layer 3 — h1: upstream pool (client) and the binary use it
 # directly. Server-side wiring goes through transport+lifecycle.
+# `conduit-lifecycle` carries an integration-test dev-dependency on
+# h1 so it can demonstrate the full ingress→dispatch→upstream
+# composition in `tests/end_to_end.rs`. The dev-dep does not appear
+# in any production build graph.
 [[bans.deny]]
 crate = "conduit-h1"
-wrappers = ["conduit-upstream", "conduit"]
+wrappers = ["conduit-upstream", "conduit-lifecycle", "conduit"]
 
 [[bans.deny]]
 crate = "conduit-h2"
