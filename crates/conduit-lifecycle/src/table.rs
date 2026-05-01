@@ -43,7 +43,7 @@ pub struct Route {
     pub total_timeout: std::time::Duration,
 }
 
-/// Path-matching kinds. Regex is parsed but not yet evaluated.
+/// Path-matching kinds.
 #[derive(Debug, Clone)]
 pub enum PathMatch {
     /// Match any path.
@@ -52,17 +52,34 @@ pub enum PathMatch {
     Prefix(String),
     /// `path_exact = "/healthz"` — request path equals this string.
     Exact(String),
+    /// `path_regex = "^/v(?P<v>\d+)/.+"` — request path is matched
+    /// against the compiled regex. Compiled once at config-load.
+    Regex(regex::Regex),
 }
 
 impl Route {
     /// Build a route from the config struct. Picks the first non-empty
-    /// path matcher in priority order: exact > prefix > regex (regex
-    /// is currently swallowed; see deviations).
+    /// path matcher in priority order: exact > prefix > regex > any.
+    /// An invalid regex falls back to `PathMatch::Any` and logs an
+    /// error — the validator in conduit-config rejects unparseable
+    /// regexes at load time, so this is purely defensive.
     pub fn from_config(cfg: &conduit_config::Route) -> Self {
         let path = if let Some(s) = cfg.match_.path_exact.as_ref() {
             PathMatch::Exact(s.clone())
         } else if let Some(s) = cfg.match_.path_prefix.as_ref() {
             PathMatch::Prefix(s.clone())
+        } else if let Some(s) = cfg.match_.path_regex.as_ref() {
+            match regex::Regex::new(s) {
+                Ok(re) => PathMatch::Regex(re),
+                Err(e) => {
+                    tracing::error!(
+                        regex = %s,
+                        error = %e,
+                        "route path_regex did not compile; route will match any path",
+                    );
+                    PathMatch::Any
+                }
+            }
         } else {
             PathMatch::Any
         };
@@ -75,8 +92,8 @@ impl Route {
     }
 }
 
-/// Per-host bucket of routes, indexed for O(1) exact-path lookup and
-/// length-sorted prefix scanning.
+/// Per-host bucket of routes, indexed for O(1) exact-path lookup,
+/// length-sorted prefix scanning, and ordered regex evaluation.
 #[derive(Debug, Clone, Default)]
 struct HostBucket {
     /// Exact-path routes, keyed by the literal path string.
@@ -84,6 +101,9 @@ struct HostBucket {
     /// Prefix routes sorted by prefix length descending (most-specific
     /// first), with declaration order preserved as the tie-breaker.
     prefix_sorted: Vec<(String, Route)>,
+    /// Regex routes in declaration order. Tried after exact + prefix
+    /// fail; the first regex that matches wins.
+    regex_routes: Vec<Route>,
     /// The first `PathMatch::Any` route declared in this bucket, if any.
     any: Option<Route>,
 }
@@ -101,6 +121,9 @@ impl HostBucket {
                 if !self.prefix_sorted.iter().any(|(pp, _)| pp == p) {
                     self.prefix_sorted.push((p.clone(), r.clone()));
                 }
+            }
+            PathMatch::Regex(_) => {
+                self.regex_routes.push(r);
             }
             PathMatch::Any => {
                 if self.any.is_none() {
@@ -124,6 +147,13 @@ impl HostBucket {
         for (prefix, r) in &self.prefix_sorted {
             if path.starts_with(prefix.as_str()) {
                 return Some(r);
+            }
+        }
+        for r in &self.regex_routes {
+            if let PathMatch::Regex(re) = &r.path {
+                if re.is_match(path) {
+                    return Some(r);
+                }
             }
         }
         self.any.as_ref()
@@ -487,6 +517,35 @@ mod tests {
             "exact match should beat prefix in the same bucket",
         );
         assert_eq!(t.find(None, "/api/users").unwrap().upstream, "api");
+    }
+
+    #[test]
+    fn regex_match_falls_through_after_prefix() {
+        // Routes:
+        //   /static/   prefix → upstream "static"
+        //   ^/v\d+/.*  regex  → upstream "versioned"
+        let re = regex::Regex::new(r"^/v\d+/.*").unwrap();
+        let t = table(vec![
+            route(None, PathMatch::Prefix("/static/".into()), "static"),
+            route(None, PathMatch::Regex(re), "versioned"),
+        ]);
+        assert_eq!(t.find(None, "/static/x").unwrap().upstream, "static");
+        assert_eq!(t.find(None, "/v1/items").unwrap().upstream, "versioned");
+        assert_eq!(t.find(None, "/v42/foo").unwrap().upstream, "versioned");
+        assert!(t.find(None, "/other").is_none());
+    }
+
+    #[test]
+    fn regex_first_match_wins_in_declaration_order() {
+        let re_a = regex::Regex::new(r"^/api/.+").unwrap();
+        let re_b = regex::Regex::new(r"^/api/v2/.+").unwrap();
+        // Declaration order: re_a first; even though re_b is more
+        // specific, the first regex that matches is returned.
+        let t = table(vec![
+            route(None, PathMatch::Regex(re_a), "first"),
+            route(None, PathMatch::Regex(re_b), "second"),
+        ]);
+        assert_eq!(t.find(None, "/api/v2/items").unwrap().upstream, "first");
     }
 
     #[test]

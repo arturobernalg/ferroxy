@@ -65,6 +65,10 @@ signal-hook = "0.3"
 # Hot-swap of the live Dispatch under SIGHUP without a Mutex on the
 # hot path. Charter rule: no Arc<Mutex<…>> on per-request paths.
 arc-swap = "1"
+# Regex path matching (per-route `path_regex`). Compiled once at
+# config-load and reused on the hot path; the compiled Regex is
+# Send + Sync and uses internal arenas so each match is allocation-free.
+regex = "1"
 
 # P2 — proto layer (request/response stream contract)
 http = "1"

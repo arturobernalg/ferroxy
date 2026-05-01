@@ -197,6 +197,7 @@ fn dummy_config_with_route(
         PathMatch::Any => {}
         PathMatch::Prefix(p) => fields.push(format!("path_prefix = \"{p}\"")),
         PathMatch::Exact(p) => fields.push(format!("path_exact = \"{p}\"")),
+        PathMatch::Regex(re) => fields.push(format!("path_regex = \"{}\"", re.as_str())),
     }
     // Validator rejects empty match; we always pass at least one
     // field. PathMatch::Any with no host is the only edge-case the
