@@ -86,8 +86,13 @@ pub enum ForwardError {
     BreakerOpen,
 }
 
-/// Upstream holding a shared H1 client + retry policy + the list of
-/// backend addresses to dial.
+/// hyper-rustls connector type. Wraps a plain `HttpConnector` (so
+/// `http://...` URIs continue to work) and adds rustls TLS for
+/// `https://...` URIs. The same `Client` instance routes by scheme.
+type Connector = hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
+
+/// Upstream holding a shared H1/H2 client + retry policy + the list
+/// of backend addresses to dial.
 ///
 /// Cheap to clone — the inner `Client` is `Arc`-backed by hyper-util,
 /// and `addrs` is shared via `Arc` so per-request access is a refcount
@@ -102,7 +107,7 @@ pub enum ForwardError {
 /// later cleanup; the field-level cost stays the same.
 #[derive(Clone)]
 pub struct Upstream {
-    client: Client<hyper_util::client::legacy::connect::HttpConnector, BodyOf<Bytes>>,
+    client: Client<Connector, BodyOf<Bytes>>,
     retry: RetryPolicy,
     addrs: std::sync::Arc<[std::net::SocketAddr]>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -166,10 +171,22 @@ impl Upstream {
         breaker: BreakerConfig,
         connect_timeout: Option<Duration>,
     ) -> Self {
-        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+        http.enforce_http(false); // allow `https://` URIs
         if let Some(d) = connect_timeout {
-            connector.set_connect_timeout(Some(d));
+            http.set_connect_timeout(Some(d));
         }
+        // Default rustls ClientConfig: webpki-tokio-bundled root
+        // store, TLS 1.2 + 1.3, ALPN advertising http/1.1 and h2.
+        // Per-upstream TLS overrides (custom CA, mTLS,
+        // insecure_skip_verify) are P9.x scope; they require building
+        // a per-upstream Client which the current shared-Client
+        // pattern does not yet support.
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http);
         let client = Client::builder(TokioExecutor::new()).build(connector);
         // One breaker per addr. Vec → Arc<[T]> avoids per-request
         // refcount work; the breakers themselves are interior-mutable.

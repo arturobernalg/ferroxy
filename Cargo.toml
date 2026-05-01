@@ -96,6 +96,11 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 # replacement for the now-archived rustls-pemfile crate (RUSTSEC-2025-0134).
 rustls-pki-types = "1.9"
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
+# Upstream HTTPS / mTLS via hyper-util's Client. webpki-tokio bundles
+# the platform root store at compile time so the binary doesn't have
+# to read /etc/ssl/certs at runtime; that fits the static-binary
+# deployment shape conduit ships in.
+hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio", "http1", "http2", "ring", "tls12", "logging"] }
 
 # P9 — HTTP/3 (QUIC + h3). quinn 0.11 is the de-facto Rust QUIC stack;
 # h3 + h3-quinn from hyperium provide HTTP/3 framing on top of it.

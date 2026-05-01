@@ -32,6 +32,12 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
+    # webpki-roots ships the Mozilla CA bundle under CDLA-Permissive-2.0,
+    # which is a permissive data license (the OSI hasn't certified it
+    # but the Linux Foundation publishes it). We accept it for the
+    # bundled root store; no source file in conduit is licensed
+    # under it.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 private = { ignore = true }

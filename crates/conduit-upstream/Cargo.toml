@@ -22,6 +22,9 @@ hyper-util = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
