@@ -33,6 +33,10 @@ pub struct Route {
     pub host: Option<String>,
     /// Path matcher.
     pub path: PathMatch,
+    /// Header predicates. **Every** entry must match for the route to
+    /// be a candidate. Pre-lowercased header name + exact value
+    /// match. Empty list means no header predicate.
+    pub header_matches: Vec<(http::HeaderName, http::HeaderValue)>,
     /// Name of the upstream to dispatch to. Resolved at config-load
     /// time against the [`UpstreamMap`]; if absent, the validator in
     /// `conduit-config` already rejected the document.
@@ -41,6 +45,21 @@ pub struct Route {
     /// `[[route]] timeouts.total`. The dispatcher wraps the upstream
     /// forward in a `tokio::time::timeout` of this duration.
     pub total_timeout: std::time::Duration,
+}
+
+impl Route {
+    /// Test whether `headers` satisfies every entry in this route's
+    /// `header_matches`. A route with no header predicates always
+    /// matches; otherwise every name+value pair must be present.
+    fn headers_match(&self, headers: &http::HeaderMap) -> bool {
+        for (name, want) in &self.header_matches {
+            match headers.get(name) {
+                Some(got) if got == want => {}
+                _ => return false,
+            }
+        }
+        true
+    }
 }
 
 /// Path-matching kinds.
@@ -83,9 +102,23 @@ impl Route {
         } else {
             PathMatch::Any
         };
+        // Translate header predicates from the schema into hot-path
+        // friendly types. `try_from` rejects empty / non-ascii names
+        // and values; the validator already screened them.
+        let header_matches = cfg
+            .match_
+            .headers
+            .iter()
+            .filter_map(|hm| {
+                let name = http::HeaderName::try_from(hm.name.as_str()).ok()?;
+                let value = http::HeaderValue::try_from(hm.value.as_str()).ok()?;
+                Some((name, value))
+            })
+            .collect();
         Self {
             host: cfg.match_.host.clone(),
             path,
+            header_matches,
             upstream: cfg.upstream.clone(),
             total_timeout: cfg.timeouts.total.into(),
         }
@@ -93,42 +126,49 @@ impl Route {
 }
 
 /// Per-host bucket of routes, indexed for O(1) exact-path lookup,
-/// length-sorted prefix scanning, and ordered regex evaluation.
+/// length-sorted prefix scanning, and ordered regex evaluation. Each
+/// slot holds a `Vec<Route>` in declaration order so header
+/// predicates can fall through to less-specific routes.
 #[derive(Debug, Clone, Default)]
 struct HostBucket {
-    /// Exact-path routes, keyed by the literal path string.
-    by_exact: HashMap<String, Route>,
+    /// Exact-path routes, keyed by the literal path string. Multiple
+    /// routes can share the same path if they differ in header
+    /// predicates; the vec preserves declaration order.
+    by_exact: HashMap<String, Vec<Route>>,
     /// Prefix routes sorted by prefix length descending (most-specific
     /// first), with declaration order preserved as the tie-breaker.
-    prefix_sorted: Vec<(String, Route)>,
+    /// Multiple routes per prefix are allowed for the same reason as
+    /// `by_exact`.
+    prefix_sorted: Vec<(String, Vec<Route>)>,
     /// Regex routes in declaration order. Tried after exact + prefix
-    /// fail; the first regex that matches wins.
+    /// fail; the first regex whose header predicates also match wins.
     regex_routes: Vec<Route>,
-    /// The first `PathMatch::Any` route declared in this bucket, if any.
-    any: Option<Route>,
+    /// `PathMatch::Any` routes in declaration order. The first whose
+    /// header predicates also match wins.
+    any: Vec<Route>,
 }
 
 impl HostBucket {
     /// Insert a route into the bucket. Per the charter's "first in
-    /// declaration order wins" rule, the first insertion at a given
-    /// exact-path / prefix / "any" slot keeps the slot.
+    /// declaration order wins" rule, the order within each slot's
+    /// `Vec<Route>` is the order routes were declared.
     fn insert(&mut self, r: Route) {
         match &r.path {
             PathMatch::Exact(p) => {
-                self.by_exact.entry(p.clone()).or_insert_with(|| r.clone());
+                self.by_exact.entry(p.clone()).or_default().push(r);
             }
             PathMatch::Prefix(p) => {
-                if !self.prefix_sorted.iter().any(|(pp, _)| pp == p) {
-                    self.prefix_sorted.push((p.clone(), r.clone()));
+                if let Some(slot) = self.prefix_sorted.iter_mut().find(|(pp, _)| pp == p) {
+                    slot.1.push(r);
+                } else {
+                    self.prefix_sorted.push((p.clone(), vec![r]));
                 }
             }
             PathMatch::Regex(_) => {
                 self.regex_routes.push(r);
             }
             PathMatch::Any => {
-                if self.any.is_none() {
-                    self.any = Some(r);
-                }
+                self.any.push(r);
             }
         }
     }
@@ -140,23 +180,27 @@ impl HostBucket {
             .sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
     }
 
-    fn find(&self, path: &str) -> Option<&Route> {
-        if let Some(r) = self.by_exact.get(path) {
-            return Some(r);
-        }
-        for (prefix, r) in &self.prefix_sorted {
-            if path.starts_with(prefix.as_str()) {
+    fn find(&self, path: &str, headers: &http::HeaderMap) -> Option<&Route> {
+        if let Some(slot) = self.by_exact.get(path) {
+            if let Some(r) = slot.iter().find(|r| r.headers_match(headers)) {
                 return Some(r);
             }
         }
-        for r in &self.regex_routes {
-            if let PathMatch::Regex(re) = &r.path {
-                if re.is_match(path) {
+        for (prefix, slot) in &self.prefix_sorted {
+            if path.starts_with(prefix.as_str()) {
+                if let Some(r) = slot.iter().find(|r| r.headers_match(headers)) {
                     return Some(r);
                 }
             }
         }
-        self.any.as_ref()
+        for r in &self.regex_routes {
+            if let PathMatch::Regex(re) = &r.path {
+                if re.is_match(path) && r.headers_match(headers) {
+                    return Some(r);
+                }
+            }
+        }
+        self.any.iter().find(|r| r.headers_match(headers))
     }
 }
 
@@ -202,21 +246,28 @@ impl RouteTable {
         t
     }
 
-    /// Find the route that matches `(host, path)`. Tries the
-    /// host-keyed bucket first (case-folded), then falls back to the
-    /// wildcard bucket. Within a bucket, exact > longest-prefix >
-    /// any. Returns `None` if no route matches.
-    pub fn find(&self, host: Option<&str>, path: &str) -> Option<&Route> {
+    /// Find the route that matches `(host, path, headers)`. Tries
+    /// the host-keyed bucket first (case-folded), then falls back to
+    /// the wildcard bucket. Within a bucket, exact > longest-prefix >
+    /// regex > any; routes with header predicates are skipped if any
+    /// predicate fails, falling through to less-specific routes.
+    /// Returns `None` if no route matches.
+    pub fn find(
+        &self,
+        host: Option<&str>,
+        path: &str,
+        headers: &http::HeaderMap,
+    ) -> Option<&Route> {
         if let Some(h) = host {
             // ASCII-only fold; HTTP host names are ASCII.
             let key = h.to_ascii_lowercase();
             if let Some(bucket) = self.by_host.get(&key) {
-                if let Some(r) = bucket.find(path) {
+                if let Some(r) = bucket.find(path, headers) {
                     return Some(r);
                 }
             }
         }
-        self.wildcard.find(path)
+        self.wildcard.find(path, headers)
     }
 
     /// Number of routes (for observability / tests).
@@ -356,11 +407,12 @@ impl Dispatch {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let path = req.uri().path().to_owned();
+        let headers = req.headers().clone();
 
         let route = self
             .inner
             .routes
-            .find(host.as_deref(), &path)
+            .find(host.as_deref(), &path, &headers)
             .cloned()
             .ok_or(DispatchError::NoRoute)?;
         let upstream = self
@@ -417,12 +469,18 @@ mod tests {
         Route {
             host: host.map(str::to_owned),
             path,
+            header_matches: Vec::new(),
             upstream: upstream.to_owned(),
             // Tests build Routes by hand without going through TOML;
             // give them a tame default so timeout-unaware tests don't
             // accidentally fire it.
             total_timeout: std::time::Duration::from_secs(30),
         }
+    }
+
+    /// Empty header map for tests that don't exercise header matching.
+    fn no_headers() -> http::HeaderMap {
+        http::HeaderMap::new()
     }
 
     fn table(routes: Vec<Route>) -> RouteTable {
@@ -458,17 +516,21 @@ mod tests {
             ),
             route(Some("api.example.com"), PathMatch::Any, "api-default"),
         ]);
-        let r = t.find(Some("api.example.com"), "/v1/items").unwrap();
+        let r = t
+            .find(Some("api.example.com"), "/v1/items", &no_headers())
+            .unwrap();
         assert_eq!(r.upstream, "api-v1");
-        let r = t.find(Some("api.example.com"), "/health").unwrap();
+        let r = t
+            .find(Some("api.example.com"), "/health", &no_headers())
+            .unwrap();
         assert_eq!(r.upstream, "api-default");
     }
 
     #[test]
     fn host_match_is_case_insensitive() {
         let t = table(vec![route(Some("Example.COM"), PathMatch::Any, "u")]);
-        assert!(t.find(Some("example.com"), "/").is_some());
-        assert!(t.find(Some("EXAMPLE.COM"), "/").is_some());
+        assert!(t.find(Some("example.com"), "/", &no_headers()).is_some());
+        assert!(t.find(Some("EXAMPLE.COM"), "/", &no_headers()).is_some());
     }
 
     #[test]
@@ -477,10 +539,20 @@ mod tests {
             route(Some("a.example.com"), PathMatch::Any, "a"),
             route(None, PathMatch::Any, "fallback"),
         ]);
-        assert_eq!(t.find(None, "/").unwrap().upstream, "fallback");
-        assert_eq!(t.find(Some("a.example.com"), "/").unwrap().upstream, "a");
         assert_eq!(
-            t.find(Some("b.example.com"), "/").unwrap().upstream,
+            t.find(None, "/", &no_headers()).unwrap().upstream,
+            "fallback"
+        );
+        assert_eq!(
+            t.find(Some("a.example.com"), "/", &no_headers())
+                .unwrap()
+                .upstream,
+            "a"
+        );
+        assert_eq!(
+            t.find(Some("b.example.com"), "/", &no_headers())
+                .unwrap()
+                .upstream,
             "fallback"
         );
     }
@@ -488,24 +560,24 @@ mod tests {
     #[test]
     fn path_exact_does_not_match_prefix() {
         let t = table(vec![route(None, PathMatch::Exact("/healthz".into()), "h")]);
-        assert!(t.find(None, "/healthz").is_some());
-        assert!(t.find(None, "/healthz/").is_none());
-        assert!(t.find(None, "/healthzy").is_none());
+        assert!(t.find(None, "/healthz", &no_headers()).is_some());
+        assert!(t.find(None, "/healthz/", &no_headers()).is_none());
+        assert!(t.find(None, "/healthzy", &no_headers()).is_none());
     }
 
     #[test]
     fn path_prefix_match() {
         let t = table(vec![route(None, PathMatch::Prefix("/api/".into()), "u")]);
-        assert!(t.find(None, "/api/").is_some());
-        assert!(t.find(None, "/api/users").is_some());
-        assert!(t.find(None, "/api").is_none()); // no trailing slash
+        assert!(t.find(None, "/api/", &no_headers()).is_some());
+        assert!(t.find(None, "/api/users", &no_headers()).is_some());
+        assert!(t.find(None, "/api", &no_headers()).is_none()); // no trailing slash
     }
 
     #[test]
     fn no_match_returns_none() {
         let t = table(vec![route(Some("a.com"), PathMatch::Any, "a")]);
-        assert!(t.find(Some("b.com"), "/").is_none());
-        assert!(t.find(None, "/").is_none());
+        assert!(t.find(Some("b.com"), "/", &no_headers()).is_none());
+        assert!(t.find(None, "/", &no_headers()).is_none());
     }
 
     #[test]
@@ -521,10 +593,20 @@ mod tests {
                 "api-v2-admin",
             ),
         ]);
-        assert_eq!(t.find(None, "/api/health").unwrap().upstream, "api-root");
-        assert_eq!(t.find(None, "/api/v2/items").unwrap().upstream, "api-v2");
         assert_eq!(
-            t.find(None, "/api/v2/admin/users").unwrap().upstream,
+            t.find(None, "/api/health", &no_headers()).unwrap().upstream,
+            "api-root"
+        );
+        assert_eq!(
+            t.find(None, "/api/v2/items", &no_headers())
+                .unwrap()
+                .upstream,
+            "api-v2"
+        );
+        assert_eq!(
+            t.find(None, "/api/v2/admin/users", &no_headers())
+                .unwrap()
+                .upstream,
             "api-v2-admin"
         );
     }
@@ -536,11 +618,14 @@ mod tests {
             route(None, PathMatch::Exact("/api/health".into()), "health"),
         ]);
         assert_eq!(
-            t.find(None, "/api/health").unwrap().upstream,
+            t.find(None, "/api/health", &no_headers()).unwrap().upstream,
             "health",
             "exact match should beat prefix in the same bucket",
         );
-        assert_eq!(t.find(None, "/api/users").unwrap().upstream, "api");
+        assert_eq!(
+            t.find(None, "/api/users", &no_headers()).unwrap().upstream,
+            "api"
+        );
     }
 
     #[test]
@@ -553,10 +638,19 @@ mod tests {
             route(None, PathMatch::Prefix("/static/".into()), "static"),
             route(None, PathMatch::Regex(re), "versioned"),
         ]);
-        assert_eq!(t.find(None, "/static/x").unwrap().upstream, "static");
-        assert_eq!(t.find(None, "/v1/items").unwrap().upstream, "versioned");
-        assert_eq!(t.find(None, "/v42/foo").unwrap().upstream, "versioned");
-        assert!(t.find(None, "/other").is_none());
+        assert_eq!(
+            t.find(None, "/static/x", &no_headers()).unwrap().upstream,
+            "static"
+        );
+        assert_eq!(
+            t.find(None, "/v1/items", &no_headers()).unwrap().upstream,
+            "versioned"
+        );
+        assert_eq!(
+            t.find(None, "/v42/foo", &no_headers()).unwrap().upstream,
+            "versioned"
+        );
+        assert!(t.find(None, "/other", &no_headers()).is_none());
     }
 
     #[test]
@@ -569,7 +663,12 @@ mod tests {
             route(None, PathMatch::Regex(re_a), "first"),
             route(None, PathMatch::Regex(re_b), "second"),
         ]);
-        assert_eq!(t.find(None, "/api/v2/items").unwrap().upstream, "first");
+        assert_eq!(
+            t.find(None, "/api/v2/items", &no_headers())
+                .unwrap()
+                .upstream,
+            "first"
+        );
     }
 
     #[test]
@@ -584,12 +683,16 @@ mod tests {
         ]);
         // Host-keyed bucket finds a match; wildcard is not consulted.
         assert_eq!(
-            t.find(Some("api.example.com"), "/x").unwrap().upstream,
+            t.find(Some("api.example.com"), "/x", &no_headers())
+                .unwrap()
+                .upstream,
             "api",
         );
         // Unknown host falls back to wildcard.
         assert_eq!(
-            t.find(Some("other.com"), "/x").unwrap().upstream,
+            t.find(Some("other.com"), "/x", &no_headers())
+                .unwrap()
+                .upstream,
             "fallback"
         );
     }

@@ -54,16 +54,25 @@ fn build_table(hosts: usize, prefixes_per_host: usize) -> RouteTable {
 
 fn bench_route_lookup(c: &mut Criterion) {
     let t = build_table(100, 10);
+    let headers = http::HeaderMap::new();
 
     c.bench_function("route_lookup/exact_host_first_prefix", |b| {
         b.iter(|| {
-            black_box(t.find(black_box(Some("h0.example.com")), black_box("/p0/x")));
+            black_box(t.find(
+                black_box(Some("h0.example.com")),
+                black_box("/p0/x"),
+                &headers,
+            ));
         });
     });
 
     c.bench_function("route_lookup/exact_host_last_prefix", |b| {
         b.iter(|| {
-            black_box(t.find(black_box(Some("h99.example.com")), black_box("/p9/x")));
+            black_box(t.find(
+                black_box(Some("h99.example.com")),
+                black_box("/p9/x"),
+                &headers,
+            ));
         });
     });
 
@@ -73,6 +82,7 @@ fn bench_route_lookup(c: &mut Criterion) {
             black_box(t.find(
                 black_box(Some("unknown.example.com")),
                 black_box("/anything"),
+                &headers,
             ));
         });
     });
