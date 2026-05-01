@@ -82,11 +82,20 @@ pub enum ForwardError {
 /// Cheap to clone — the inner `Client` is `Arc`-backed by hyper-util,
 /// and `addrs` is shared via `Arc` so per-request access is a refcount
 /// bump.
+///
+/// Load balancing across `addrs` is round-robin via an `AtomicUsize`
+/// counter shared between clones — this is the only piece of shared
+/// mutable state on the per-request path. Wrapping a counter in
+/// `AtomicUsize::fetch_add` is one cycle on x86 with the relaxed
+/// ordering used here; well below the per-request budget. Other
+/// algorithms (least-connections, P2C, consistent-hash) land in
+/// later cleanup; the field-level cost stays the same.
 #[derive(Clone)]
 pub struct Upstream {
     client: Client<hyper_util::client::legacy::connect::HttpConnector, BodyOf<Bytes>>,
     retry: RetryPolicy,
     addrs: std::sync::Arc<[std::net::SocketAddr]>,
+    next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Type alias for the body type our upstream client uses for requests.
@@ -111,8 +120,9 @@ impl Upstream {
         Self::with_addrs(retry, Vec::new())
     }
 
-    /// Build with the supplied backend addresses. The first address is
-    /// used for every forwarded request until P4.x adds load balancing.
+    /// Build with the supplied backend addresses. Requests round-robin
+    /// across `addrs` via an `AtomicUsize` counter shared by all
+    /// clones of this `Upstream`.
     pub fn with_addrs(retry: RetryPolicy, addrs: Vec<std::net::SocketAddr>) -> Self {
         let connector = hyper_util::client::legacy::connect::HttpConnector::new();
         let client = Client::builder(TokioExecutor::new()).build(connector);
@@ -120,7 +130,18 @@ impl Upstream {
             client,
             retry,
             addrs: addrs.into(),
+            next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Return the next backend address per the round-robin policy.
+    /// Returns `None` if the upstream has no addresses configured.
+    fn pick_addr(&self) -> Option<std::net::SocketAddr> {
+        if self.addrs.is_empty() {
+            return None;
+        }
+        let n = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(self.addrs[n % self.addrs.len()])
     }
 
     /// Backend addresses (read-only).
@@ -149,11 +170,9 @@ impl Upstream {
         // negligible.
         let (mut parts, body) = req.into_parts();
 
-        // Rewrite the URI to an absolute http:// URL pointing at our
-        // first backend address, so hyper-util's client knows where
-        // to dial. P4.x replaces this with the configured load
-        // balancer's pick.
-        if let Some(addr) = self.addrs.first() {
+        // Rewrite the URI to an absolute http:// URL pointing at the
+        // backend chosen by our load balancer (round-robin today).
+        if let Some(addr) = self.pick_addr() {
             let path_and_query = parts
                 .uri
                 .path_and_query()
@@ -221,3 +240,53 @@ impl Upstream {
 /// Default request timeout when none is specified. P5 (lifecycle) will
 /// thread real per-route timeouts through; P4 keeps it loose.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sa(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn round_robin_picks_addrs_in_order() {
+        let u = Upstream::with_addrs(
+            RetryPolicy::none(),
+            vec![sa("10.0.0.1:80"), sa("10.0.0.2:80"), sa("10.0.0.3:80")],
+        );
+        let picks: Vec<_> = (0..6).map(|_| u.pick_addr().unwrap()).collect();
+        assert_eq!(
+            picks,
+            vec![
+                sa("10.0.0.1:80"),
+                sa("10.0.0.2:80"),
+                sa("10.0.0.3:80"),
+                sa("10.0.0.1:80"),
+                sa("10.0.0.2:80"),
+                sa("10.0.0.3:80"),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_addrs_returns_none() {
+        let u = Upstream::new(RetryPolicy::none());
+        assert!(u.pick_addr().is_none());
+    }
+
+    #[test]
+    fn round_robin_state_shared_across_clones() {
+        // Clones share the round-robin counter (Arc<AtomicUsize>)
+        // so that every worker thread sees a fair distribution.
+        let u = Upstream::with_addrs(
+            RetryPolicy::none(),
+            vec![sa("10.0.0.1:80"), sa("10.0.0.2:80")],
+        );
+        let u2 = u.clone();
+        assert_eq!(u.pick_addr(), Some(sa("10.0.0.1:80")));
+        assert_eq!(u2.pick_addr(), Some(sa("10.0.0.2:80")));
+        assert_eq!(u.pick_addr(), Some(sa("10.0.0.1:80")));
+        assert_eq!(u2.pick_addr(), Some(sa("10.0.0.2:80")));
+    }
+}
