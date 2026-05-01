@@ -80,16 +80,14 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if !cfg.server.listen_h3.is_empty() {
-        tracing::warn!(
-            count = cfg.server.listen_h3.len(),
-            "H3 listeners ignored: HTTP/3 ships in phase 9",
-        );
-    }
-    if cfg.server.listen_http.is_empty() && cfg.server.listen_https.is_empty() {
+    if cfg.server.listen_http.is_empty()
+        && cfg.server.listen_https.is_empty()
+        && cfg.server.listen_h3.is_empty()
+    {
         tracing::error!(
-            "no plain-HTTP or HTTPS listeners; nothing to serve. \
-             Add at least one entry to server.listen_http or server.listen_https.",
+            "no plain-HTTP, HTTPS, or H3 listeners; nothing to serve. \
+             Add at least one entry to server.listen_http, server.listen_https, \
+             or server.listen_h3.",
         );
         return ExitCode::from(78);
     }
@@ -107,6 +105,10 @@ fn main() -> ExitCode {
     // thread so its TLS handshake cost does not interfere with the
     // plaintext data-plane runtime under load.
     let https_thread = spawn_https_thread(&cfg, &dispatch);
+
+    // Spawn HTTP/3 (QUIC) listener if `[tls]` and `listen_h3` are both
+    // configured. Like HTTPS this runs on its own tokio runtime thread.
+    let h3_thread = spawn_h3_thread(&cfg, &dispatch);
 
     // Spawn the admin endpoint server on its own tokio runtime
     // thread. Sharing the data-plane runtime would couple admin
@@ -130,27 +132,15 @@ fn main() -> ExitCode {
 
     let http_trigger = server.as_ref().map(conduit_io::Server::shutdown_trigger);
     let https_cancel_for_signal = https_thread.as_ref().map(|(_, c)| Arc::clone(c));
+    let h3_cancel_for_signal = h3_thread.as_ref().map(|(_, c)| Arc::clone(c));
     let admin_cancel_for_signal = Arc::clone(&admin_cancel);
 
-    // Signal handler thread: first SIGTERM/SIGINT triggers graceful
-    // shutdown across the http data plane, the https data plane, and
-    // the admin server.
-    let signal_received = Arc::new(AtomicBool::new(false));
-    let signal_received_for_thread = Arc::clone(&signal_received);
-    let signal_thread = std::thread::Builder::new()
-        .name("conduit-signal".into())
-        .spawn(move || {
-            install_signal_handler(&signal_received_for_thread, move || {
-                if let Some(t) = http_trigger.as_ref() {
-                    t.cancel();
-                }
-                if let Some(c) = https_cancel_for_signal.as_ref() {
-                    c.store(true, Ordering::Release);
-                }
-                admin_cancel_for_signal.store(true, Ordering::Release);
-            });
-        })
-        .expect("spawn signal handler thread");
+    let (signal_received, signal_thread) = spawn_signal_thread(
+        http_trigger,
+        https_cancel_for_signal,
+        h3_cancel_for_signal,
+        admin_cancel_for_signal,
+    );
 
     let report = match server {
         Some(s) => s.wait(),
@@ -160,18 +150,14 @@ fn main() -> ExitCode {
         }
     };
 
-    // Stop admin + https.
-    admin_cancel.store(true, Ordering::Release);
-    if let Some(h) = admin_thread {
-        let _ = h.join();
-    }
-    if let Some((h, cancel)) = https_thread {
-        cancel.store(true, Ordering::Release);
-        let _ = h.join();
-    }
-
-    signal_received.store(true, Ordering::Release);
-    let _ = signal_thread.join();
+    join_aux_threads(
+        &admin_cancel,
+        admin_thread,
+        https_thread,
+        h3_thread,
+        &signal_received,
+        signal_thread,
+    );
 
     tracing::info!(
         accepted = report.accepted,
@@ -190,10 +176,14 @@ fn main() -> ExitCode {
 /// upstream, return the response. On routing or upstream error,
 /// build a synthetic 502 / 503 response so the client always gets a
 /// well-formed reply.
-async fn proxy_one(
+async fn proxy_one<B>(
     dispatch: &Dispatch,
-    req: http::Request<Incoming>,
-) -> Result<Response<conduit_proto::BoxBody>, Infallible> {
+    req: http::Request<B>,
+) -> Result<Response<conduit_proto::BoxBody>, Infallible>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     match dispatch.handle(req).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
@@ -497,6 +487,202 @@ fn run_https(
                         }
                     });
                 }
+            }));
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+    });
+}
+
+/// Spawn the signal-handler thread. Returns the parent-done flag (so
+/// the main thread can short-circuit the handler on a clean shutdown
+/// that did not come from a signal) and the join handle.
+fn spawn_signal_thread(
+    http_trigger: Option<conduit_io::ShutdownTrigger>,
+    https_cancel: Option<Arc<AtomicBool>>,
+    h3_cancel: Option<Arc<AtomicBool>>,
+    admin_cancel: Arc<AtomicBool>,
+) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let signal_received = Arc::new(AtomicBool::new(false));
+    let signal_received_for_thread = Arc::clone(&signal_received);
+    let handle = std::thread::Builder::new()
+        .name("conduit-signal".into())
+        .spawn(move || {
+            install_signal_handler(&signal_received_for_thread, move || {
+                if let Some(t) = http_trigger.as_ref() {
+                    t.cancel();
+                }
+                if let Some(c) = https_cancel.as_ref() {
+                    c.store(true, Ordering::Release);
+                }
+                if let Some(c) = h3_cancel.as_ref() {
+                    c.store(true, Ordering::Release);
+                }
+                admin_cancel.store(true, Ordering::Release);
+            });
+        })
+        .expect("spawn signal handler thread");
+    (signal_received, handle)
+}
+
+/// Stop and join the admin / https / h3 / signal-handler threads
+/// after the data plane has reported shutdown. Each cancel flag is
+/// flipped before its thread is joined so the loops exit promptly.
+fn join_aux_threads(
+    admin_cancel: &Arc<AtomicBool>,
+    admin_thread: Option<std::thread::JoinHandle<()>>,
+    https_thread: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>,
+    h3_thread: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>,
+    signal_received: &Arc<AtomicBool>,
+    signal_thread: std::thread::JoinHandle<()>,
+) {
+    admin_cancel.store(true, Ordering::Release);
+    if let Some(h) = admin_thread {
+        let _ = h.join();
+    }
+    if let Some((h, cancel)) = https_thread {
+        cancel.store(true, Ordering::Release);
+        let _ = h.join();
+    }
+    if let Some((h, cancel)) = h3_thread {
+        cancel.store(true, Ordering::Release);
+        let _ = h.join();
+    }
+    signal_received.store(true, Ordering::Release);
+    let _ = signal_thread.join();
+}
+
+/// Spawn the H3 listener thread if `[tls]` is configured and at
+/// least one H3 listen address is set. Returns `None` if H3 is
+/// disabled or the TLS config could not be loaded; the binary
+/// continues without H3 in that case.
+fn spawn_h3_thread(
+    cfg: &conduit_config::Config,
+    dispatch: &Arc<Dispatch>,
+) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
+    if cfg.server.listen_h3.is_empty() {
+        return None;
+    }
+    let Some(tls_cfg) = cfg.tls.as_ref() else {
+        tracing::error!(
+            count = cfg.server.listen_h3.len(),
+            "H3 listeners configured but no [tls] section; ignoring",
+        );
+        return None;
+    };
+    // Load a fresh ServerConfig and override its ALPN to advertise
+    // only `h3` — QUIC negotiates ALPN as part of the TLS handshake
+    // and rejects connections whose offered protocols don't intersect.
+    let mut rustls_cfg = match conduit_transport::load_server_config(tls_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "TLS server config failed; H3 disabled");
+            return None;
+        }
+    };
+    rustls_cfg.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic_cfg = match conduit_h3::quic_server_config(rustls_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "QUIC server config failed; H3 disabled");
+            return None;
+        }
+    };
+
+    let dispatch_clone = Arc::clone(dispatch);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_clone = Arc::clone(&cancel);
+    let addrs = cfg.server.listen_h3.clone();
+    let handle = std::thread::Builder::new()
+        .name("conduit-h3-rt".into())
+        .spawn(move || run_h3(addrs, quic_cfg, dispatch_clone, cancel_clone))
+        .expect("spawn h3 thread");
+    Some((handle, cancel))
+}
+
+/// Drive the H3 listeners on a dedicated thread. Builds a
+/// multi-thread tokio runtime, opens a `quinn::Endpoint` per
+/// `listen_h3` address, and accepts QUIC connections in a loop until
+/// `cancel` is set. Each connection is handed to
+/// `conduit-h3::serve_connection`.
+fn run_h3(
+    addrs: Vec<std::net::SocketAddr>,
+    quic_cfg: quinn::ServerConfig,
+    dispatch: Arc<Dispatch>,
+    cancel: Arc<AtomicBool>,
+) {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("conduit-h3")
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build h3 runtime");
+            return;
+        }
+    };
+    rt.block_on(async move {
+        let mut endpoints = Vec::with_capacity(addrs.len());
+        for addr in &addrs {
+            match quinn::Endpoint::server(quic_cfg.clone(), *addr) {
+                Ok(ep) => {
+                    let local = ep.local_addr().unwrap_or(*addr);
+                    tracing::info!(addr = %local, "listening (h3/quic)");
+                    endpoints.push(ep);
+                }
+                Err(e) => {
+                    tracing::error!(addr = %addr, error = %e, "h3 bind failed");
+                    return;
+                }
+            }
+        }
+
+        let mut tasks = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            let dispatch = Arc::clone(&dispatch);
+            let cancel = Arc::clone(&cancel);
+            tasks.push(tokio::spawn(async move {
+                while !cancel.load(Ordering::Acquire) {
+                    let timed = tokio::time::timeout(
+                        std::time::Duration::from_millis(250),
+                        endpoint.accept(),
+                    )
+                    .await;
+                    let connecting = match timed {
+                        Ok(Some(c)) => c,
+                        Ok(None) => break,  // endpoint closed
+                        Err(_) => continue, // timeout → recheck cancel
+                    };
+                    let dispatch = Arc::clone(&dispatch);
+                    tokio::spawn(async move {
+                        let conn = match connecting.await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::debug!(error = %e, "quic handshake failed");
+                                return;
+                            }
+                        };
+                        let peer = conn.remote_address();
+                        let handler = move |req: http::Request<Bytes>| {
+                            let dispatch = Arc::clone(&dispatch);
+                            async move {
+                                let (parts, body) = req.into_parts();
+                                let req = http::Request::from_parts(
+                                    parts,
+                                    http_body_util::Full::new(body),
+                                );
+                                proxy_one(&dispatch, req).await
+                            }
+                        };
+                        if let Err(e) = conduit_h3::serve_connection(conn, handler).await {
+                            tracing::warn!(?peer, error = %e, "h3 connection ended with error");
+                        }
+                    });
+                }
+                endpoint.close(0u32.into(), b"shutting down");
             }));
         }
         for t in tasks {

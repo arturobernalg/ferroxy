@@ -10,3 +10,16 @@ description = "Layer 3: HTTP/3 (RFC 9114) over QUIC, QPACK (RFC 9204)."
 workspace = true
 
 [dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+conduit-proto = { workspace = true }
