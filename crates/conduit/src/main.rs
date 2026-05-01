@@ -108,7 +108,7 @@ fn main() -> ExitCode {
         // to get its connection handler. The handler reads nothing,
         // writes nothing, just drops the stream — there is no protocol
         // yet. The H1 parser in phase 3 replaces this.
-        |_stream: conduit_io::MonoioTcpStream, _peer: std::net::SocketAddr| async move {
+        |_stream: conduit_io::TcpStream, _peer: std::net::SocketAddr| async move {
             // Intentionally empty: accept-and-close.
         }
     }) {

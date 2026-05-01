@@ -4,14 +4,28 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Layer 1: monoio listeners, accept loop, thread-per-core worker model, buffer pool."
+description = "Layer 1: listeners, accept loop, thread-per-core worker model. Linux-first (monoio + io_uring); non-Linux dev path uses tokio."
 
 [lints]
 workspace = true
 
+[features]
+# Force the tokio backend even on Linux. Used by the bench harness in
+# Phase 11 to drive nginx/Pingora comparisons under tokio. Default is
+# auto-selection: monoio on Linux, tokio on non-Linux.
+runtime-tokio = []
+
 [dependencies]
-monoio = { workspace = true }
+# Runtime-agnostic: bind helper, error types, logging.
 socket2 = { workspace = true }
-core_affinity = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# tokio is always pulled so the cross-platform compile path does not
+# bitrot on Linux. It is only *used* when the active backend is tokio.
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# Production backend: Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+monoio = { workspace = true }
+core_affinity = { workspace = true }

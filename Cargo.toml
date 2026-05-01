@@ -51,9 +51,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
 # P1 — io layer
+# monoio is the production runtime on Linux. tokio is the development
+# fallback for macOS / non-Linux portability builds; it also serves as
+# the comparison runtime for the bench harness in Phase 11.
 monoio = { version = "0.2", default-features = false, features = ["legacy", "iouring", "macros"] }
-socket2 = { version = "0.5", features = ["all"] }
 core_affinity = "0.8"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "signal", "time", "sync", "io-util"] }
+tokio-util = "0.7"
+socket2 = { version = "0.5", features = ["all"] }
 # binary-only: signal handling. Cleaner than rolling sigaction by hand
 # and keeps `unsafe_code = "forbid"` everywhere else.
 signal-hook = "0.3"
