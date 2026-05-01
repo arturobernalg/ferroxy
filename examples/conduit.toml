@@ -1,10 +1,16 @@
-# Example conduit configuration. Validates with `conduit --config examples/conduit.toml --check`.
+# Example conduit configuration covering every schema field that
+# ships today. Validate with:
+#   conduit --config examples/conduit.toml --check
 #
-# This file exercises the full schema; cert/key paths are placeholders and
-# `--check` will fail until they exist on disk. Replace with real paths or
-# remove the [tls] block + listen_https/listen_h3 to validate.
+# Cert/key paths are placeholders; --check fails until the files
+# exist. Remove [tls] + listen_https/listen_h3 to validate without
+# them.
 
 [server]
+# `monoio` is the production Linux runtime; `tokio` is the dev /
+# comparison runtime. The selection is currently a compile-time
+# feature flag (`runtime-tokio`); the runtime field documents the
+# intent and feeds the per-target build picker.
 runtime = "monoio"
 workers = "auto"
 cpu_affinity = true
@@ -14,37 +20,111 @@ listen_h3    = ["0.0.0.0:443"]
 admin_listen   = "127.0.0.1:9090"
 metrics_listen = "127.0.0.1:9091"
 
+# ---- ingress TLS ----------------------------------------------------
+# One [[tls.certs]] entry per SNI pattern. The first entry serves as
+# the default-server fallback when SNI is absent or doesn't match.
+# `*.foo.com` matches one DNS label below `foo.com`.
 [tls]
 min_version = "1.2"
 alpn = ["h3", "h2", "http/1.1"]
 session_tickets = true
 ocsp_stapling = true
 certs = [
-    { sni = "example.com",   cert = "/etc/conduit/example.crt",   key = "/etc/conduit/example.key" },
-    { sni = "*.example.com", cert = "/etc/conduit/wildcard.crt",  key = "/etc/conduit/wildcard.key" },
+    { sni = "example.com",     cert = "/etc/conduit/example.crt",   key = "/etc/conduit/example.key" },
+    { sni = "*.example.com",   cert = "/etc/conduit/wildcard.crt",  key = "/etc/conduit/wildcard.key" },
+    { sni = "api.example.com", cert = "/etc/conduit/api.crt",       key = "/etc/conduit/api.key" },
 ]
 
+# ---- upstreams -----------------------------------------------------
+
+# Plain HTTP upstream with active health checks.
 [[upstream]]
 name = "api"
 addrs = ["10.0.0.1:8080", "10.0.0.2:8080"]
-protocol = "h2"
-lb = "p2c"
+protocol = "http1"
+lb = "round_robin"
 connect_timeout = "2s"
 pool = { max_idle_per_host = 64, idle_timeout = "60s", max_lifetime = "10m" }
-health_check = { path = "/healthz", interval = "5s", unhealthy_threshold = 3, timeout = "1s" }
+health_check = { path = "/healthz", interval = "5s", timeout = "1s", unhealthy_threshold = 3, healthy_threshold = 1 }
 
+# Plain HTTP upstream, no probes — the passive breaker still
+# rotates a bad backend out after `BreakerConfig::default()`
+# consecutive failures (5 today, 30s cooldown).
 [[upstream]]
 name = "static"
 addrs = ["10.0.0.10:8080"]
 protocol = "http1"
 lb = "round_robin"
 
+# HTTPS upstream using the bundled webpki root store. No client
+# cert; standard verifier. If the route's URI rewrite produces an
+# `https://...` scheme, this upstream's connector handles the
+# handshake transparently.
+[[upstream]]
+name = "secure-api"
+addrs = ["10.0.0.20:8443"]
+protocol = "http1"
+lb = "round_robin"
+connect_timeout = "3s"
+
+# mTLS upstream: client presents `client.crt` / `client.key`,
+# verifies the backend cert against `ca.pem` (replaces the bundled
+# webpki roots for this upstream only). Both client_cert and
+# client_key must be set together.
+[[upstream]]
+name = "internal"
+addrs = ["10.0.0.30:8443"]
+protocol = "http1"
+lb = "round_robin"
+connect_timeout = "1s"
+
+[upstream.tls]
+ca = "/etc/conduit/upstream-ca.pem"
+client_cert = "/etc/conduit/client.crt"
+client_key = "/etc/conduit/client.key"
+verify = true
+
+# ---- routes --------------------------------------------------------
+# Routing precedence (within one host bucket):
+#   1. exact path             ← O(1) hash lookup
+#   2. longest prefix         ← longest-first scan
+#   3. regex                  ← declaration-order, first match wins
+#   4. wildcard               ← falls through if nothing else matches
+# Routes with header predicates fall through to less-specific routes
+# when the predicates fail.
+
+# Exact-path health endpoint, served fast.
+[[route]]
+match = { host = "api.example.com", path_exact = "/healthz" }
+upstream = "api"
+timeouts = { connect = "1s", read = "5s", write = "5s", total = "5s" }
+
+# Header-routed canary slice: requests with `x-tier: canary` go to
+# `secure-api`, everything else falls through to the next route.
+[[route]]
+match = { host = "api.example.com", path_prefix = "/", headers = [{ name = "x-tier", value = "canary" }] }
+upstream = "secure-api"
+timeouts = { connect = "2s", read = "30s", write = "30s", total = "60s" }
+
+# Default api host with retry on 5xx and connect errors.
 [[route]]
 match = { host = "api.example.com", path_prefix = "/" }
 upstream = "api"
 timeouts = { connect = "2s", read = "30s", write = "30s", total = "60s" }
 retry = { attempts = 2, on_status = [502, 503, 504], on_connect_error = true }
 
+# Versioned API via regex.
 [[route]]
-match = { host = "example.com", path_prefix = "/static" }
+match = { host = "api.example.com", path_regex = "^/v[0-9]+/.+" }
+upstream = "secure-api"
+
+# Static content on a wildcard host.
+[[route]]
+match = { host = "*.static.example.com", path_prefix = "/" }
 upstream = "static"
+
+# Internal service over mTLS, accessed at /internal/* on the api host.
+[[route]]
+match = { host = "api.example.com", path_prefix = "/internal/" }
+upstream = "internal"
+timeouts = { connect = "1s", read = "10s", write = "10s", total = "15s" }
