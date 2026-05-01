@@ -87,13 +87,17 @@ pub fn load_server_config(cfg: &conduit_config::TlsConfig) -> Result<ServerConfi
     let certs = load_certs(&cert_spec.cert)?;
     let key = load_key(&cert_spec.key)?;
 
-    let server_cfg = ServerConfig::builder()
+    let mut server_cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|source| TlsError::Rustls {
             sni: cert_spec.sni.clone(),
             source,
         })?;
+    // Advertise HTTP/2 first, falling back to HTTP/1.1. RFC 7540 §3.3
+    // requires h2 over TLS to be ALPN-negotiated, and most clients
+    // pick whichever the server lists first that they support.
+    server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(server_cfg)
 }
 

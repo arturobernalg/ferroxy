@@ -38,6 +38,7 @@ tokio = { workspace = true }
 conduit-config = { workspace = true }
 conduit-io = { workspace = true }
 conduit-h1 = { workspace = true }
+conduit-h2 = { workspace = true }
 conduit-lifecycle = { workspace = true }
 conduit-proto = { workspace = true }
 conduit-control = { workspace = true }

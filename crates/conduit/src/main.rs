@@ -466,12 +466,34 @@ fn run_https(
                                 return;
                             }
                         };
+                        // ALPN dispatch: rustls writes the negotiated
+                        // protocol into the connection state. `h2` →
+                        // conduit-h2, anything else (incl. http/1.1
+                        // and absent ALPN) → conduit-h1.
+                        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
                         let handler = move |req: http::Request<Incoming>| {
                             let dispatch = Arc::clone(&dispatch);
                             async move { proxy_one(&dispatch, req).await }
                         };
-                        if let Err(e) = conduit_h1::serve_connection(tls, handler).await {
-                            tracing::warn!(?peer, error = %e, "https connection ended with error");
+                        match alpn.as_deref() {
+                            Some(b"h2") => {
+                                if let Err(e) = conduit_h2::serve_connection(tls, handler).await {
+                                    tracing::warn!(
+                                        ?peer,
+                                        error = %e,
+                                        "https/h2 connection ended with error",
+                                    );
+                                }
+                            }
+                            _ => {
+                                if let Err(e) = conduit_h1::serve_connection(tls, handler).await {
+                                    tracing::warn!(
+                                        ?peer,
+                                        error = %e,
+                                        "https/h1 connection ended with error",
+                                    );
+                                }
+                            }
                         }
                     });
                 }
