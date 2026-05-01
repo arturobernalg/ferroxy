@@ -34,9 +34,8 @@ What Conduit is **not**:
 ## Status
 
 Pre-1.0. Active development. Each phase of the build plan ships only after the full quality gate
-is green; the [Roadmap](#roadmap) below reflects actual state, not aspiration. The binary
-currently loads and validates a configuration and accepts plain TCP connections via the io
-layer; it cannot yet serve HTTP traffic.
+is green. The binary currently loads and validates a configuration and accepts plain TCP
+connections via the io layer; it cannot yet serve HTTP traffic.
 
 ## Supported Platforms
 
@@ -319,58 +318,6 @@ cargo fuzz run h1_parser -- -max_total_time=60
 # Microbenchmarks (lands in Phase 11)
 cargo criterion --workspace
 ```
-
-## Roadmap
-
-<a id="roadmap"></a>
-
-### Done
-
-- **Phase 0** — Workspace skeleton, `conduit-config` (parse + validate), CLI, structured
-  logging, dependency-direction lints in `deny.toml`.
-
-### In progress
-
-- **Phase 1** — `conduit-io`: monoio listener, thread-per-core worker model with
-  `SO_REUSEPORT`, CPU pinning, `io_uring` (registered buffers deferred to a P1.x cleanup pass),
-  graceful shutdown on `SIGTERM` / `SIGINT`.
-
-### Planned (v1)
-
-- **Phase 2** — `conduit-proto`: shared request/response stream contract with property tests.
-- **Phase 3** — `conduit-h1`: parse, serialize, end-to-end forward to a mock upstream;
-  per-request `bumpalo` arena.
-- **Phase 4** — `conduit-upstream` (h1): sharded per-worker pool, health checks, passive
-  ejection, circuit breaker, retry.
-- **Phase 5** — `conduit-lifecycle`: prefix-trie route table built at config load, filter
-  chain, timeout enforcement.
-- **Phase 6** — `conduit-transport`: TLS via `rustls` + `aws-lc-rs`, SNI, certificate
-  hot-reload via `arc-swap`.
-- **Phase 7** — `conduit-h2`: server then client; `h2spec` 100% server-side; HPACK fuzz target.
-- **Phase 8** — Protocol translation (H2 ingress → H1 egress) preserving trailers,
-  cancellation, and back-pressure.
-- **Phase 9** — `conduit-h3`: QUIC + H3 with interop against `quiche` and `ngtcp2`; 0-RTT
-  off by default.
-- **Phase 10** — `conduit-control`: `SIGHUP` hot-reload, admin endpoints, full Prometheus
-  metrics, OpenTelemetry tracing wiring.
-- **Phase 11** — Benchmark harness in `bench/`: `docker-compose` driving Conduit, nginx, and
-  Pingora against four upstream servers under identical sysctls, worker counts, and cipher
-  suites.
-- **Phase 11.5** — Profile against the target workload; identify the top five hot functions;
-  publish findings to `PROFILING.md`.
-- **Phase 11.6** *(conditional)* — Replace `hyper` on the hot path with direct H1/H2 state
-  machines on monoio I/O traits if Phase 11.5 numbers justify the rewrite.
-- **Phase 12** — Production polish: Dockerfile (multi-stage, distroless), `systemd` unit, full
-  CI workflow (`.github/workflows/ci.yml`), `ARCHITECTURE.md`, `CONFIG.md`, `BENCHMARKS.md`,
-  `CONTRIBUTING.md`, `LICENSE-APACHE`, `LICENSE-MIT`.
-
-### Future (post-v1)
-
-- Response caching with revalidation primitives.
-- Rate-limiting and connection throttling at the lifecycle layer.
-- Plug-in story for filters (only after the v1 filter API has stabilised under real load).
-- Additional crypto providers behind a cargo feature.
-- Non-Linux portability builds via the `runtime-tokio` cargo feature.
 
 ## Contributing
 
