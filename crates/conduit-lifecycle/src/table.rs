@@ -423,30 +423,37 @@ impl Dispatch {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let host = req
-            .headers()
-            .get(HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let path = req.uri().path().to_owned();
-        let headers = req.headers().clone();
+        // Hot path: take *borrows* of the request for the route
+        // lookup and the upstream lookup, then drop them before
+        // moving req into upstream.forward(). The previous
+        // implementation cloned host (String), path (String), and
+        // the entire HeaderMap before calling find — four heap
+        // allocations per request that we can avoid by keeping the
+        // borrows alive only as long as the route table needs them.
+        //
+        // `upstream` is cloned (refcount bump on the Arc-shared
+        // Client + Vec<Breaker>) and `total` is `Copy`, so we can
+        // hand both off and let the borrows die at end of block.
+        let (upstream, total) = {
+            let host = req.headers().get(HOST).and_then(|v| v.to_str().ok());
+            let path = req.uri().path();
+            let headers = req.headers();
+            let route = self
+                .inner
+                .routes
+                .find(host, path, headers)
+                .ok_or(DispatchError::NoRoute)?;
+            let upstream = self
+                .inner
+                .upstreams
+                .get(&route.upstream)
+                .cloned()
+                .ok_or_else(|| DispatchError::UpstreamNotRegistered {
+                    name: route.upstream.clone(),
+                })?;
+            (upstream, route.total_timeout)
+        };
 
-        let route = self
-            .inner
-            .routes
-            .find(host.as_deref(), &path, &headers)
-            .cloned()
-            .ok_or(DispatchError::NoRoute)?;
-        let upstream = self
-            .inner
-            .upstreams
-            .get(&route.upstream)
-            .cloned()
-            .ok_or_else(|| DispatchError::UpstreamNotRegistered {
-                name: route.upstream.clone(),
-            })?;
-
-        let total = route.total_timeout;
         match tokio::time::timeout(total, upstream.forward(req)).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => Err(DispatchError::Upstream(e)),
