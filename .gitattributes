@@ -1,0 +1,3 @@
+# Fuzz seed files contain raw HTTP wire bytes — keep CRLFs intact
+# regardless of platform autocrlf settings.
+fuzz/seeds/** -text
