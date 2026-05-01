@@ -1,0 +1,22 @@
+# Bench-harness conduit config. Routes everything to a single
+# upstream that the bench script starts as a tiny static-file server
+# on 127.0.0.1:8001 (see bench/run.sh).
+[server]
+runtime = "tokio"
+workers = "auto"
+cpu_affinity = false
+listen_http  = ["127.0.0.1:8000"]
+listen_https = []
+listen_h3    = []
+admin_listen   = "127.0.0.1:9000"
+metrics_listen = "127.0.0.1:9001"
+
+[[upstream]]
+name = "backend"
+addrs = ["127.0.0.1:8001"]
+protocol = "http1"
+lb = "round_robin"
+
+[[route]]
+match = { host = "*", path_prefix = "/" }
+upstream = "backend"

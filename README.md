@@ -34,10 +34,12 @@ What Conduit is **not**:
 ## Status
 
 Pre-1.0. Active development. Each phase of the build plan ships only after the full quality gate
-is green. The binary currently routes plain HTTP/1.1 traffic to a configured upstream — given a
-TOML config with a route and an upstream address, `conduit` will accept HTTP/1.1 connections,
-match each request against the route table, and forward to the selected backend. TLS, HTTP/2,
-HTTP/3, hot-reload, and the metrics endpoint arrive in their own phases.
+is green. The binary terminates TLS, accepts HTTP/1.1, HTTP/2 (over TLS+ALPN), and HTTP/3
+(over QUIC) on its ingress side; routes via a host+path table loaded from TOML; and forwards
+to a configured upstream pool over HTTP/1.1 with round-robin load balancing and configurable
+retries. SIGHUP reloads the route / upstream tables atomically; SIGTERM and SIGINT trigger a
+graceful shutdown across every plane. An admin server on a separate runtime exposes
+`/health`, `/ready`, and a Prometheus `/metrics` endpoint.
 
 ## Supported Platforms
 
@@ -82,42 +84,43 @@ not tested and not recommended for any use.
 
 ## Features
 
-Items marked **(planned)** are part of the v1 plan but not yet implemented.
-
 **Protocols**
-- HTTP/1.1 (RFC 9110, RFC 9112) with chunked transfer encoding, trailers, and pipelining on
-  ingress  **(planned)**
-- HTTP/2 (RFC 9113) with HPACK, flow control, and `h2spec` 100% server-side  **(planned)**
-- HTTP/3 (RFC 9114, QPACK RFC 9204) over QUIC, with connection migration and `Alt-Svc`
-  advertisement  **(planned)**
-- TLS 1.2 / 1.3 termination via `rustls` with `aws-lc-rs` as the crypto provider  **(planned)**
-- Mutual TLS to upstream  **(planned)**
+- HTTP/1.1 (RFC 9110, RFC 9112) ingress and egress, on plaintext or TLS
+- HTTP/2 (RFC 9113) ingress over TLS+ALPN; HTTP/2 → HTTP/1.1 translation to upstream
+- HTTP/3 (RFC 9114, QPACK RFC 9204) ingress over QUIC; same translation to HTTP/1.1 upstream
+- TLS 1.2 / 1.3 termination via `rustls` with the `ring` crypto provider
 
 **Routing**
-- Host-based virtual hosts  **(planned)**
-- Path matching: prefix, exact, regex  **(planned)**
-- Header-based routing  **(planned)**
+- Host-based virtual hosts
+- Path matching: prefix
+- Per-route upstream selection from a registered pool
 
 **Load balancing**
-- Round-robin, least-connections, power-of-two-choices, consistent hash  **(planned)**
+- Round-robin across an upstream's address list
 
 **Resilience**
-- Active health checks (HTTP probes) and passive ejection on consecutive failures  **(planned)**
-- Per-upstream circuit breaker  **(planned)**
-- Configurable retry policy (status codes, connect errors, attempt count)  **(planned)**
-- Separate timeouts: connect, read, write, total  **(planned)**
+- Configurable retry policy (status codes, connect errors, attempt count)
+- Per-upstream and per-route retry policies
 
 **Observability**
-- Prometheus metrics endpoint  **(planned)**
-- OpenTelemetry tracing with W3C `traceparent` propagation  **(planned)**
-- Structured access logs (text or JSON)  **(planned)**
+- Prometheus `/metrics` endpoint (text exposition 0.0.4) with `conduit_uptime_seconds`
+  and `conduit_build_info`
+- Structured access logs (text or JSON, selected via `--log-json`)
+- `tracing`-compatible event stream throughout the data plane
 
 **Operations**
 - TOML configuration with strict validation
-- Hot config reload via `SIGHUP`  **(planned)**
+- Hot config reload via `SIGHUP` (routes / upstreams swapped atomically; failed reloads
+  leave the previous configuration running)
 - Graceful shutdown via `SIGTERM` / `SIGINT`
-- Admin endpoints (`/health`, `/ready`, `/config`, `/pools`, `/reload`)  **(planned)**
-- `systemd`-ready service unit  **(planned)**
+- Admin endpoints (`/health`, `/ready`, `/metrics`) on a dedicated runtime
+- `systemd`-ready service unit at [`contrib/conduit.service`](./contrib/conduit.service)
+
+A small set of charter items intentionally remain follow-up scope and are tracked per-phase
+in the project's `phase{N}_deviations` notes — notably SNI multi-cert + OCSP stapling
+(P6.x), upstream H2 / H3 client (P7.x / P9.x), regex / header routing and active health
+checks (P5.x), the full per-route metric family (P10.x.x), and mTLS to upstream
+(P9.x). The roadmap is implementation order, not capability gating.
 
 ## Architecture
 
@@ -145,7 +148,7 @@ threaded through layers via explicit context, never thread-locals.
 The `conduit-proto` crate sits beside the protocol layer and exposes the single shared
 request/response stream type that every protocol implementation maps to and that the lifecycle
 layer consumes; it is the one explicit abstraction that the project pays for. See
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design treatment (forthcoming).
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design treatment.
 
 ## Quick Start
 
@@ -202,8 +205,9 @@ With a backend listening on `127.0.0.1:9000` (e.g. `python3 -m http.server 9000`
 curl -i http://127.0.0.1:8080/
 ```
 
-> The HTTP forwarding path is implemented in Phase 3 (`conduit-h1`). Until that phase lands,
-> the binary accepts the TCP connection and closes it without speaking HTTP.
+The response is forwarded from the configured upstream. Add an entry to
+[`bench/run.sh`](./bench/run.sh) for a self-contained loopback round-trip
+(`wrk --(:8000)--> conduit --(:8001)--> python http.server`).
 
 ## Configuration
 
@@ -256,8 +260,8 @@ match    = { host = "static.example.com", path_prefix = "/" }
 upstream = "static"
 ```
 
-The annotated reference example lives at [`examples/conduit.toml`](./examples/conduit.toml). The
-full key-by-key reference will be published as [`CONFIG.md`](./CONFIG.md) (forthcoming).
+The annotated reference example lives at [`examples/conduit.toml`](./examples/conduit.toml).
+The full key-by-key reference is in [`CONFIG.md`](./CONFIG.md).
 
 ## Performance
 
@@ -275,8 +279,9 @@ config) on RPS, p99 latency, and RPS-per-core on this exact profile, on the same
 kernel sysctls, and day**, with all three proxies driven by `bench/run.sh`.
 
 Benchmark results against nginx and Pingora on the target workload profile are tracked in
-[`BENCHMARKS.md`](./BENCHMARKS.md) and updated on each release. No numbers are published before
-Phase 11 of the build plan completes.
+[`BENCHMARKS.md`](./BENCHMARKS.md). The repo ships a loopback regression harness at
+[`bench/run.sh`](./bench/run.sh); the full nginx / Pingora comparison runs land in P11.x and
+are documented separately when they do.
 
 ## Building and Testing
 
@@ -340,7 +345,7 @@ cargo deny    check
 
 Hot-path changes additionally require a benchmark in `bench/micro/` showing no regression
 against the previous milestone (or a commit message explaining the win). See
-[`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full process (forthcoming with Phase 12).
+[`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full process.
 
 ## Security
 

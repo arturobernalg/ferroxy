@@ -3,6 +3,9 @@
 Cargo.lock.bak
 .DS_Store
 
+# bench harness scratch dir (recreated by bench/run.sh)
+/bench/.fixtures/
+
 # IDE
 /.idea/
 /.vscode/
