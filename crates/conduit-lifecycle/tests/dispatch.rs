@@ -98,6 +98,66 @@ async fn dispatch_routes_to_matching_upstream() {
     assert_eq!(&body[..], b"routed");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_times_out_when_upstream_stalls() {
+    // Bind a listener that accepts the connection but never replies,
+    // forcing the per-route total timeout to fire.
+    let (listener, addr) = loopback().await;
+
+    let mut upstreams = UpstreamMap::new();
+    upstreams.insert(
+        "slow",
+        Upstream::with_addrs(RetryPolicy::none(), vec![addr]),
+    );
+
+    // Build a config with a 100ms total timeout via TOML; this keeps
+    // the test independent of DurationStr defaults.
+    let toml_text = r#"
+[server]
+admin_listen = "127.0.0.1:9090"
+metrics_listen = "127.0.0.1:9091"
+listen_http = ["0.0.0.0:80"]
+
+[[upstream]]
+name = "slow"
+addrs = ["10.0.0.1:8080"]
+protocol = "http1"
+
+[[route]]
+match = { host = "x" }
+upstream = "slow"
+timeouts = { connect = "1s", read = "1s", write = "1s", total = "100ms" }
+"#;
+    let cfg = conduit_config::parse(toml_text).expect("parse");
+    let routes = RouteTable::from_config(&cfg);
+    let dispatch = Dispatch::new(routes, upstreams);
+
+    let req = http::Request::builder()
+        .uri(format!("http://{addr}/"))
+        .header("host", "x")
+        .body(Full::new(Bytes::new()))
+        .expect("build");
+
+    // Accept-but-don't-respond server: holds the connection past the
+    // timeout deadline.
+    let server = async move {
+        let (_stream, _peer) = listener.accept().await.expect("accept");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    let client = async { dispatch.handle(req).await };
+
+    let ((), result) = tokio::join!(server, client);
+    match result {
+        Err(DispatchError::Timeout(d)) => {
+            assert!(
+                d <= std::time::Duration::from_millis(150),
+                "timeout was {d:?}, expected ~100ms",
+            );
+        }
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn dispatch_returns_no_route_when_nothing_matches() {
     let upstreams = UpstreamMap::new();

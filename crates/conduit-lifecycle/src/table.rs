@@ -37,6 +37,10 @@ pub struct Route {
     /// time against the [`UpstreamMap`]; if absent, the validator in
     /// `conduit-config` already rejected the document.
     pub upstream: String,
+    /// Wall-clock cap on the entire request, derived from
+    /// `[[route]] timeouts.total`. The dispatcher wraps the upstream
+    /// forward in a `tokio::time::timeout` of this duration.
+    pub total_timeout: std::time::Duration,
 }
 
 /// Path-matching kinds. Regex is parsed but not yet evaluated.
@@ -66,6 +70,7 @@ impl Route {
             host: cfg.match_.host.clone(),
             path,
             upstream: cfg.upstream.clone(),
+            total_timeout: cfg.timeouts.total.into(),
         }
     }
 }
@@ -313,7 +318,12 @@ impl Dispatch {
                 name: route.upstream.clone(),
             })?;
 
-        upstream.forward(req).await.map_err(DispatchError::Upstream)
+        let total = route.total_timeout;
+        match tokio::time::timeout(total, upstream.forward(req)).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(DispatchError::Upstream(e)),
+            Err(_) => Err(DispatchError::Timeout(total)),
+        }
     }
 }
 
@@ -338,6 +348,11 @@ pub enum DispatchError {
     /// The upstream client returned an error.
     #[error("upstream forward failed")]
     Upstream(#[source] ForwardError),
+
+    /// The per-route total timeout fired before the upstream responded.
+    /// Surfaces as a `504 Gateway Timeout` to the client.
+    #[error("upstream did not respond within {0:?}")]
+    Timeout(std::time::Duration),
 }
 
 #[cfg(test)]
@@ -349,6 +364,10 @@ mod tests {
             host: host.map(str::to_owned),
             path,
             upstream: upstream.to_owned(),
+            // Tests build Routes by hand without going through TOML;
+            // give them a tame default so timeout-unaware tests don't
+            // accidentally fire it.
+            total_timeout: std::time::Duration::from_secs(30),
         }
     }
 

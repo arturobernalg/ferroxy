@@ -255,6 +255,15 @@ where
                 "conduit: upstream unavailable\n",
             ))
         }
+        Err(conduit_lifecycle::DispatchError::Timeout(total)) => {
+            tracing::warn!(?total, "request exceeded route total timeout");
+            metrics.observe_upstream_failed();
+            metrics.observe_status(504);
+            Ok(error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "conduit: upstream timed out\n",
+            ))
+        }
         Err(other) => {
             // `DispatchError` is non_exhaustive so future variants
             // (e.g. P5.x's filter-rejection) compile here without
