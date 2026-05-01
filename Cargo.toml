@@ -13,6 +13,11 @@ members = [
     "crates/conduit-transport",
     "crates/conduit-upstream",
 ]
+# `fuzz/` is its own cargo-fuzz workspace root with its own deps
+# (libfuzzer-sys et al.). Exclude it so `cargo build --workspace`
+# does not try to compile it on every CI run; cargo-fuzz drives it
+# separately via `cargo fuzz run`.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -69,6 +74,10 @@ arc-swap = "1"
 # config-load and reused on the hot path; the compiled Regex is
 # Send + Sync and uses internal arenas so each match is allocation-free.
 regex = "1"
+
+# Microbenches (charter rule: hot-path changes ship a no-regression
+# criterion bench). Dev-dep only; never reaches the release graph.
+criterion = { version = "0.5", features = ["html_reports"] }
 
 # P2 — proto layer (request/response stream contract)
 http = "1"

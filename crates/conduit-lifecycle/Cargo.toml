@@ -27,3 +27,8 @@ regex = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 conduit-h1 = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "route_lookup"
+harness = false

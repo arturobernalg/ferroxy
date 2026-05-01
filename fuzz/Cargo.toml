@@ -1,0 +1,23 @@
+[package]
+name = "conduit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# A separate crate so the fuzz dependencies (libfuzzer-sys, plus the
+# specific parsers we drive) do not reach the production graph.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+httparse = "1"
+bytes = "1"
+
+[[bin]]
+name = "h1_parser"
+path = "fuzz_targets/h1_parser.rs"
+test = false
+doc = false
+bench = false
