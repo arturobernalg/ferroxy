@@ -249,11 +249,19 @@ where
         Err(conduit_lifecycle::DispatchError::Upstream(e)) => {
             tracing::warn!(error = ?e, "upstream forward failed");
             metrics.observe_upstream_failed();
-            metrics.observe_status(502);
-            Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                "conduit: upstream unavailable\n",
-            ))
+            // Distinguish breaker-open (fail-fast, expected during a
+            // backend incident) from other forward failures so
+            // operators can see the difference in dashboards.
+            let (status, body) = if matches!(e, conduit_upstream::ForwardError::BreakerOpen) {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "conduit: upstream breaker open\n",
+                )
+            } else {
+                (StatusCode::BAD_GATEWAY, "conduit: upstream unavailable\n")
+            };
+            metrics.observe_status(status.as_u16());
+            Ok(error_response(status, body))
         }
         Err(conduit_lifecycle::DispatchError::Timeout(total)) => {
             tracing::warn!(?total, "request exceeded route total timeout");

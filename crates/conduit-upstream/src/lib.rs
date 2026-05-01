@@ -27,8 +27,10 @@
 
 #![deny(missing_docs)]
 
+mod breaker;
 mod retry;
 
+pub use breaker::{Breaker, BreakerConfig, Decision as BreakerDecision};
 pub use retry::{RetryDecision, RetryPolicy};
 
 use std::time::Duration;
@@ -74,6 +76,12 @@ pub enum ForwardError {
         /// Status code of the most recent attempt.
         last_status: http::StatusCode,
     },
+
+    /// The upstream's circuit breaker is open; the request was
+    /// rejected without attempting a connection. The breaker resets
+    /// when the cooldown elapses and a probe succeeds.
+    #[error("upstream circuit breaker is open")]
+    BreakerOpen,
 }
 
 /// Upstream holding a shared H1 client + retry policy + the list of
@@ -96,6 +104,10 @@ pub struct Upstream {
     retry: RetryPolicy,
     addrs: std::sync::Arc<[std::net::SocketAddr]>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Passive circuit breaker. Shared via `Arc` so all clones of an
+    /// `Upstream` see the same trip state — failure observations on
+    /// one worker influence subsequent decisions on every worker.
+    breaker: std::sync::Arc<Breaker>,
 }
 
 /// Type alias for the body type our upstream client uses for requests.
@@ -122,8 +134,19 @@ impl Upstream {
 
     /// Build with the supplied backend addresses. Requests round-robin
     /// across `addrs` via an `AtomicUsize` counter shared by all
-    /// clones of this `Upstream`.
+    /// clones of this `Upstream`. The breaker uses default config —
+    /// to override it at construction time use [`Upstream::with_breaker`].
     pub fn with_addrs(retry: RetryPolicy, addrs: Vec<std::net::SocketAddr>) -> Self {
+        Self::with_breaker(retry, addrs, BreakerConfig::default())
+    }
+
+    /// Build with explicit breaker configuration. A `threshold` of 0
+    /// disables the breaker entirely.
+    pub fn with_breaker(
+        retry: RetryPolicy,
+        addrs: Vec<std::net::SocketAddr>,
+        breaker: BreakerConfig,
+    ) -> Self {
         let connector = hyper_util::client::legacy::connect::HttpConnector::new();
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Self {
@@ -131,6 +154,7 @@ impl Upstream {
             retry,
             addrs: addrs.into(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            breaker: std::sync::Arc::new(Breaker::new(breaker)),
         }
     }
 
@@ -165,6 +189,15 @@ impl Upstream {
         B: BodyBytes + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        // Fail fast if the breaker is open. The check is two atomic
+        // loads — well below the per-request budget. A request that
+        // arrives during half-open is allowed; the next outcome
+        // (success/failure) decides whether the breaker re-arms or
+        // closes.
+        if matches!(self.breaker.check(), BreakerDecision::Reject) {
+            return Err(ForwardError::BreakerOpen);
+        }
+
         // Buffer the body so retries can replay it. P4 target workload
         // has <1 KB request bodies p95; the buffering cost is
         // negligible.
@@ -220,7 +253,18 @@ impl Upstream {
                 Ok(resp) => {
                     last_status = resp.status();
                     match self.retry.decide_status(last_status, attempt) {
-                        RetryDecision::Stop => return Ok(resp),
+                        RetryDecision::Stop => {
+                            // 5xx responses still count as failures
+                            // for breaker purposes — the upstream is
+                            // up but not serving. 2xx/3xx/4xx all reset
+                            // the breaker.
+                            if last_status.is_server_error() {
+                                self.breaker.on_failure();
+                            } else {
+                                self.breaker.on_success();
+                            }
+                            return Ok(resp);
+                        }
                         RetryDecision::Retry => {
                             tracing::debug!(
                                 attempt = attempt + 1,
@@ -242,6 +286,7 @@ impl Upstream {
                         );
                         continue;
                     }
+                    self.breaker.on_failure();
                     return Err(ForwardError::Client {
                         source: e,
                         connect_error,
@@ -249,6 +294,9 @@ impl Upstream {
                 }
             }
         }
+        // Loop exhausted retries without `Stop`-ing. Treat as failure
+        // for breaker purposes too.
+        self.breaker.on_failure();
         Err(ForwardError::RetriesExhausted { last_status })
     }
 }

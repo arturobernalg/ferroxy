@@ -278,3 +278,48 @@ async fn h2_ingress_translates_to_h1_egress() {
         "request line lost path: {request_text:?}",
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn breaker_opens_after_consecutive_connect_failures() {
+    use conduit_upstream::{BreakerConfig, ForwardError};
+
+    // Bind and immediately drop the listener so the address points at
+    // nothing — every connection attempt will fail.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let dead_addr = listener.local_addr().expect("local_addr");
+    drop(listener);
+
+    let upstream = Upstream::with_breaker(
+        RetryPolicy::none(),
+        vec![dead_addr],
+        BreakerConfig {
+            threshold: 2,
+            cooldown: std::time::Duration::from_secs(60),
+        },
+    );
+
+    // Helper: build a fresh request for each attempt (Request<Full>
+    // is single-use — the body buffer is consumed by forward()).
+    let req = || {
+        http::Request::builder()
+            .uri(format!("http://{dead_addr}/"))
+            .body(Full::new(Bytes::new()))
+            .expect("build")
+    };
+
+    // First attempt: real connect failure.
+    match upstream.forward(req()).await {
+        Err(ForwardError::Client { connect_error, .. }) => assert!(connect_error),
+        other => panic!("expected Client connect-error, got {other:?}"),
+    }
+    // Second attempt: trips the breaker (now at threshold).
+    match upstream.forward(req()).await {
+        Err(ForwardError::Client { connect_error, .. }) => assert!(connect_error),
+        other => panic!("expected Client connect-error, got {other:?}"),
+    }
+    // Third attempt: breaker is open, no connection attempted.
+    match upstream.forward(req()).await {
+        Err(ForwardError::BreakerOpen) => {}
+        other => panic!("expected BreakerOpen, got {other:?}"),
+    }
+}

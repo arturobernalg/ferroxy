@@ -253,6 +253,7 @@ dependencies = [
  "conduit-lifecycle",
  "conduit-proto",
  "conduit-transport",
+ "conduit-upstream",
  "http",
  "http-body-util",
  "hyper",
