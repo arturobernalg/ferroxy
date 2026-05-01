@@ -209,6 +209,9 @@ The response is forwarded from the configured upstream. Add an entry to
 [`bench/run.sh`](./bench/run.sh) for a self-contained loopback round-trip
 (`wrk --(:8000)--> conduit --(:8001)--> python http.server`).
 
+A per-phase rundown of what's shipped lives in
+[`CHANGELOG.md`](./CHANGELOG.md).
+
 ## Configuration
 
 Conduit is configured via a single TOML file. The schema is strictly validated at load: unknown
