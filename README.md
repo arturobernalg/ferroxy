@@ -47,12 +47,17 @@ operating systems are supported for development.
 
 Release binaries are published for:
 
-| Target                      | Notes                |
-|-----------------------------|----------------------|
-| `x86_64-unknown-linux-gnu`  | glibc, most distros  |
-| `x86_64-unknown-linux-musl` | static, Alpine       |
-| `aarch64-unknown-linux-gnu` | glibc, ARM64         |
-| `aarch64-unknown-linux-musl`| static, ARM64        |
+| Target                      | Notes                              |
+|-----------------------------|------------------------------------|
+| `x86_64-unknown-linux-gnu`  | glibc, most distros                |
+| `x86_64-unknown-linux-musl` | static, Alpine                     |
+| `aarch64-unknown-linux-gnu` | glibc, ARM64                       |
+| `aarch64-unknown-linux-musl`| static, ARM64 (planned, see below) |
+
+> `aarch64-unknown-linux-musl` is currently disabled in CI: a `libc::statx`
+> symbol that monoio 0.2.4 references is not exposed by libc 0.2.186 on
+> that target. The target will return once monoio or libc upstream the
+> fix.
 
 A multi-arch Docker image (`linux/amd64`, `linux/arm64`) is also published.
 

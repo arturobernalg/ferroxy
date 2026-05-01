@@ -22,7 +22,11 @@ jobs:
           - x86_64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
+          # aarch64-unknown-linux-musl temporarily skipped: monoio 0.2.4
+          # references `libc::statx` which is not exposed by libc 0.2.186
+          # on that target. Re-enable once monoio bumps to a version that
+          # avoids the symbol on musl targets, or once libc upstreams
+          # statx for aarch64-musl. Tracked in phase1_deviations.
     steps:
       - uses: actions/checkout@v4
 
