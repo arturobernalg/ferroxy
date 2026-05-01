@@ -18,3 +18,8 @@ tokio-rustls = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Self-signed cert + key generation for SNI resolver tests. Test-only;
+# never reaches the production dep graph.
+rcgen = "0.14"

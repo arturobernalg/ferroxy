@@ -69,36 +69,116 @@ pub enum TlsError {
 /// `rustls::ServerConfig` is `Arc`-backed.
 pub use tokio_rustls::TlsAcceptor;
 
-/// Load + parse the cert chain + key for the *first* `[[tls.certs]]`
-/// entry and build a `rustls::ServerConfig`. Subsequent entries are
-/// logged and ignored (SNI selection lands in P6.x).
+/// Build a `rustls::ServerConfig` from every `[[tls.certs]]` entry in
+/// the config. Each entry contributes one cert+key bound to its SNI
+/// pattern; at handshake time the resolver matches the client's SNI
+/// against the table.
+///
+/// SNI matching is two-pass:
+///   1. case-insensitive exact match against the SNI patterns
+///   2. wildcard match (`*.foo.com` matches one DNS label below `foo.com`)
+///
+/// When no SNI is supplied (or when nothing matches), the first cert
+/// declared in the config is used.
 ///
 /// Returns a `ServerConfig` that requires no client cert and accepts
 /// either TLS 1.2 or 1.3 per the `tls.min_version` config field.
 pub fn load_server_config(cfg: &conduit_config::TlsConfig) -> Result<ServerConfig, TlsError> {
-    let cert_spec = cfg.certs.first().ok_or(TlsError::NoCerts)?;
-    if cfg.certs.len() > 1 {
-        tracing::warn!(
-            extra = cfg.certs.len() - 1,
-            "multiple [[tls.certs]] entries; P6 uses only the first \
-             (SNI selection is deferred to P6.x)",
-        );
+    if cfg.certs.is_empty() {
+        return Err(TlsError::NoCerts);
     }
-    let certs = load_certs(&cert_spec.cert)?;
-    let key = load_key(&cert_spec.key)?;
+    let resolver = MultiCertResolver::from_config(&cfg.certs)?;
 
     let mut server_cfg = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|source| TlsError::Rustls {
-            sni: cert_spec.sni.clone(),
-            source,
-        })?;
+        .with_cert_resolver(Arc::new(resolver));
     // Advertise HTTP/2 first, falling back to HTTP/1.1. RFC 7540 §3.3
     // requires h2 over TLS to be ALPN-negotiated, and most clients
     // pick whichever the server lists first that they support.
     server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(server_cfg)
+}
+
+/// SNI-aware cert resolver. Holds an exact-match table for full host
+/// names and a wildcard table for `*.example.com`-style patterns.
+/// Falls back to the first registered cert when SNI is absent or no
+/// pattern matches — matching nginx's default-server behaviour.
+#[derive(Debug)]
+struct MultiCertResolver {
+    /// Lower-cased SNI → `CertifiedKey` for exact-match patterns.
+    exact: std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>,
+    /// `(suffix, ck)` for wildcard patterns. `suffix` is the part after
+    /// `*.` (e.g. `example.com` for `*.example.com`), pre-lowercased.
+    wildcard: Vec<(String, Arc<rustls::sign::CertifiedKey>)>,
+    /// First cert declared in the config; used when SNI is absent or
+    /// when nothing in the tables matches. Mirrors nginx's
+    /// `default_server` behaviour.
+    fallback: Arc<rustls::sign::CertifiedKey>,
+}
+
+impl MultiCertResolver {
+    fn from_config(specs: &[conduit_config::CertSpec]) -> Result<Self, TlsError> {
+        let mut exact = std::collections::HashMap::with_capacity(specs.len());
+        let mut wildcard = Vec::new();
+        let mut fallback: Option<Arc<rustls::sign::CertifiedKey>> = None;
+        for spec in specs {
+            let certs = load_certs(&spec.cert)?;
+            let key = load_key(&spec.key)?;
+            let signing_key =
+                rustls::crypto::ring::sign::any_supported_type(&key).map_err(|source| {
+                    TlsError::Rustls {
+                        sni: spec.sni.clone(),
+                        source,
+                    }
+                })?;
+            let ck = Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key));
+            if fallback.is_none() {
+                fallback = Some(Arc::clone(&ck));
+            }
+            if let Some(suffix) = spec.sni.strip_prefix("*.") {
+                wildcard.push((suffix.to_ascii_lowercase(), ck));
+            } else {
+                exact.insert(spec.sni.to_ascii_lowercase(), ck);
+            }
+        }
+        Ok(Self {
+            exact,
+            wildcard,
+            fallback: fallback.expect("specs non-empty was checked by the caller"),
+        })
+    }
+
+    fn lookup(&self, sni: &str) -> Arc<rustls::sign::CertifiedKey> {
+        let key = sni.to_ascii_lowercase();
+        if let Some(ck) = self.exact.get(&key) {
+            return Arc::clone(ck);
+        }
+        // `*.foo.com` matches `bar.foo.com` (one label below). Reject
+        // matches with multiple labels (no `*.foo.com` for `x.y.foo.com`).
+        if let Some(dot_idx) = key.find('.') {
+            let suffix = &key[dot_idx + 1..];
+            for (pat, ck) in &self.wildcard {
+                if pat == suffix {
+                    return Arc::clone(ck);
+                }
+            }
+        }
+        Arc::clone(&self.fallback)
+    }
+}
+
+impl rustls::server::ResolvesServerCert for MultiCertResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let sni = client_hello.server_name().unwrap_or("");
+        Some(if sni.is_empty() {
+            Arc::clone(&self.fallback)
+        } else {
+            self.lookup(sni)
+        })
+    }
 }
 
 /// Build a `TlsAcceptor` ready to wrap incoming TCP streams.
@@ -164,6 +244,84 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `MultiCertResolver` directly from in-memory `CertifiedKey`s
+    /// for testing the matching logic without writing PEM files to disk.
+    fn fake_resolver(entries: Vec<(&str, Arc<rustls::sign::CertifiedKey>)>) -> MultiCertResolver {
+        let mut exact = std::collections::HashMap::new();
+        let mut wildcard = Vec::new();
+        let fallback = Arc::clone(&entries[0].1);
+        for (sni, ck) in entries {
+            if let Some(suffix) = sni.strip_prefix("*.") {
+                wildcard.push((suffix.to_ascii_lowercase(), ck));
+            } else {
+                exact.insert(sni.to_ascii_lowercase(), ck);
+            }
+        }
+        MultiCertResolver {
+            exact,
+            wildcard,
+            fallback,
+        }
+    }
+
+    /// Generate a fresh self-signed cert+key with rcgen and wrap it in
+    /// a `CertifiedKey`. Each call produces a unique `Arc` so pointer
+    /// identity (`Arc::ptr_eq`) tells us which entry the resolver
+    /// picked.
+    fn ck_token() -> Arc<rustls::sign::CertifiedKey> {
+        let cert = rcgen::generate_simple_self_signed(vec!["conduit.test".into()])
+            .expect("rcgen self-signed");
+        let cert_der = cert.cert.der().clone();
+        let key_der_bytes = cert.signing_key.serialize_der();
+        let key_der = rustls_pki_types::PrivatePkcs8KeyDer::from(key_der_bytes);
+        let key = rustls::crypto::ring::sign::any_supported_type(&PrivateKeyDer::Pkcs8(key_der))
+            .expect("ring accepts rcgen-generated key");
+        Arc::new(rustls::sign::CertifiedKey::new(vec![cert_der], key))
+    }
+
+    #[test]
+    fn resolver_exact_match_is_case_insensitive() {
+        let exam = ck_token();
+        let other = ck_token();
+        let r = fake_resolver(vec![
+            ("example.com", Arc::clone(&exam)),
+            ("api.example.com", Arc::clone(&other)),
+        ]);
+        assert!(Arc::ptr_eq(&r.lookup("example.com"), &exam));
+        assert!(Arc::ptr_eq(&r.lookup("EXAMPLE.com"), &exam));
+        assert!(Arc::ptr_eq(&r.lookup("api.example.com"), &other));
+    }
+
+    #[test]
+    fn resolver_wildcard_matches_one_label() {
+        let wild = ck_token();
+        let r = fake_resolver(vec![("*.example.com", Arc::clone(&wild))]);
+        assert!(Arc::ptr_eq(&r.lookup("api.example.com"), &wild));
+        assert!(Arc::ptr_eq(&r.lookup("WWW.example.com"), &wild));
+        // Two labels below: should NOT match the wildcard; falls back.
+        // Fallback is the first entry, which is `wild` here, so we'd
+        // get `wild` either way — assert via a non-matching peer.
+        let other = ck_token();
+        let r = fake_resolver(vec![
+            ("default.example.com", Arc::clone(&other)),
+            ("*.example.com", Arc::clone(&wild)),
+        ]);
+        // a.b.example.com is two labels below; wildcard does not match.
+        // No exact match either; resolver falls back to first entry.
+        assert!(Arc::ptr_eq(&r.lookup("a.b.example.com"), &other));
+    }
+
+    #[test]
+    fn resolver_falls_back_to_first_when_nothing_matches() {
+        let first = ck_token();
+        let second = ck_token();
+        let r = fake_resolver(vec![
+            ("api.example.com", Arc::clone(&first)),
+            ("*.other.com", Arc::clone(&second)),
+        ]);
+        assert!(Arc::ptr_eq(&r.lookup("unknown.host"), &first));
+    }
 
     #[test]
     fn missing_file_surfaces_path() {
