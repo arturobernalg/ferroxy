@@ -415,15 +415,3 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
 any additional terms or conditions.
-
-## Acknowledgments
-
-Conduit's design draws on the engineering of several established projects:
-
-- **nginx** — the reference for production-grade event-driven proxying.
-- **Pingora** — the existence proof that a Rust proxy can handle Cloudflare-scale traffic.
-- **Apache HTTP Server** — for the layered configuration model and the operational vocabulary.
-- **hyper** — used as the H1/H2 building block in early phases.
-- **rustls** — the crypto stack and the cleanest TLS API in any language.
-- **monoio** — the `io_uring` runtime and thread-per-core primitives.
-- **quinn** — the QUIC implementation behind HTTP/3.
