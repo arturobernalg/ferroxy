@@ -10,3 +10,8 @@ description = "Layer 3 contract: the request/response stream type that h1, h2, h
 workspace = true
 
 [dependencies]
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }

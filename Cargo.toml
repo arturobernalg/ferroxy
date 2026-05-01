@@ -63,6 +63,12 @@ socket2 = { version = "0.5", features = ["all"] }
 # and keeps `unsafe_code = "forbid"` everywhere else.
 signal-hook = "0.3"
 
+# P2 — proto layer (request/response stream contract)
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+
 # internal
 conduit-config = { path = "crates/conduit-config", version = "0.1.0" }
 conduit-control = { path = "crates/conduit-control", version = "0.1.0" }
@@ -72,6 +78,10 @@ conduit-h3 = { path = "crates/conduit-h3", version = "0.1.0" }
 conduit-io = { path = "crates/conduit-io", version = "0.1.0" }
 conduit-lifecycle = { path = "crates/conduit-lifecycle", version = "0.1.0" }
 conduit-proto = { path = "crates/conduit-proto", version = "0.1.0" }
+
+# Internal-only: exposed by `conduit-proto` for the lifecycle layer.
+# Mirroring the `http` crate's major version is a load-bearing choice;
+# do not bump without coordinating with the protocol crates.
 conduit-transport = { path = "crates/conduit-transport", version = "0.1.0" }
 conduit-upstream = { path = "crates/conduit-upstream", version = "0.1.0" }
 
