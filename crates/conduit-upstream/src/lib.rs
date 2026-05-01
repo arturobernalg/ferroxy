@@ -552,10 +552,40 @@ impl Upstream {
             .map_err(|e| ForwardError::Body(e.into()))?
             .to_bytes();
 
+        // Hot-path optimisation: the default retry policy is
+        // `attempts = 1` (no retry), in which case the loop runs once
+        // and we own `parts` / `bytes` — no need to clone before
+        // building the request. We only clone on iterations that we
+        // know will be followed by another iteration.
+        //
+        // `parts.clone()` is what costs (HeaderMap deep-clone);
+        // `bytes.clone()` is a refcount bump and effectively free.
+        // We still keep the parallel structure so a future change
+        // doesn't accidentally lose either move.
+        let attempts = self.retry.attempts.max(1);
+        let mut iter_parts = Some(parts);
+        let mut iter_bytes = Some(bytes);
         let mut last_status = http::StatusCode::INTERNAL_SERVER_ERROR;
-        for attempt in 0..self.retry.attempts.max(1) {
-            let body = http_body_util::Full::new(bytes.clone());
-            let req = http::Request::from_parts(parts.clone(), body);
+        for attempt in 0..attempts {
+            let on_last = attempt + 1 == attempts;
+            let (parts_now, bytes_now) = if on_last {
+                (
+                    iter_parts.take().expect("Some on every iteration"),
+                    iter_bytes.take().expect("Some on every iteration"),
+                )
+            } else {
+                (
+                    iter_parts
+                        .as_ref()
+                        .expect("Some on every iteration")
+                        .clone(),
+                    iter_bytes
+                        .as_ref()
+                        .expect("Some on every iteration")
+                        .clone(),
+                )
+            };
+            let req = http::Request::from_parts(parts_now, http_body_util::Full::new(bytes_now));
 
             match self.client.request(req).await {
                 Ok(resp) => {
