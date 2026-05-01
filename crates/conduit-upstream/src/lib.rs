@@ -104,10 +104,13 @@ pub struct Upstream {
     retry: RetryPolicy,
     addrs: std::sync::Arc<[std::net::SocketAddr]>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Passive circuit breaker. Shared via `Arc` so all clones of an
-    /// `Upstream` see the same trip state — failure observations on
-    /// one worker influence subsequent decisions on every worker.
-    breaker: std::sync::Arc<Breaker>,
+    /// One passive circuit breaker per backend address, indexed in
+    /// parallel with `addrs`. A bad backend is ejected from the
+    /// rotation without taking down the rest of the pool. Shared via
+    /// `Arc` so all clones see the same trip state — failures
+    /// observed on one worker influence the next request's pick on
+    /// every worker.
+    breakers: std::sync::Arc<[Breaker]>,
 }
 
 /// Type alias for the body type our upstream client uses for requests.
@@ -141,7 +144,7 @@ impl Upstream {
     }
 
     /// Build with explicit breaker configuration. A `threshold` of 0
-    /// disables the breaker entirely.
+    /// disables the breakers entirely (every addr always passes).
     pub fn with_breaker(
         retry: RetryPolicy,
         addrs: Vec<std::net::SocketAddr>,
@@ -149,23 +152,39 @@ impl Upstream {
     ) -> Self {
         let connector = hyper_util::client::legacy::connect::HttpConnector::new();
         let client = Client::builder(TokioExecutor::new()).build(connector);
+        // One breaker per addr. Vec → Arc<[T]> avoids per-request
+        // refcount work; the breakers themselves are interior-mutable.
+        let breakers: Vec<Breaker> = (0..addrs.len()).map(|_| Breaker::new(breaker)).collect();
         Self {
             client,
             retry,
             addrs: addrs.into(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            breaker: std::sync::Arc::new(Breaker::new(breaker)),
+            breakers: breakers.into(),
         }
     }
 
-    /// Return the next backend address per the round-robin policy.
-    /// Returns `None` if the upstream has no addresses configured.
-    fn pick_addr(&self) -> Option<std::net::SocketAddr> {
+    /// Pick the next backend address. Starts the round-robin scan at
+    /// `next.fetch_add(1)` and walks at most `addrs.len()` positions
+    /// looking for the first whose breaker is not Open. Returns the
+    /// chosen address and its index (so [`Upstream::forward`] knows
+    /// which breaker to update on the outcome).
+    ///
+    /// Returns `None` if every backend's breaker is Open — the caller
+    /// surfaces this as [`ForwardError::BreakerOpen`].
+    fn pick_addr(&self) -> Option<(std::net::SocketAddr, usize)> {
         if self.addrs.is_empty() {
             return None;
         }
-        let n = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(self.addrs[n % self.addrs.len()])
+        let start = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let len = self.addrs.len();
+        for offset in 0..len {
+            let idx = (start.wrapping_add(offset)) % len;
+            if matches!(self.breakers[idx].check(), BreakerDecision::Allow) {
+                return Some((self.addrs[idx], idx));
+            }
+        }
+        None
     }
 
     /// Backend addresses (read-only).
@@ -173,10 +192,34 @@ impl Upstream {
         &self.addrs
     }
 
-    /// Snapshot of the breaker's current state. Cheap; two atomic
-    /// loads. Useful for admin / metrics exposition.
+    /// Aggregate breaker state across every backend address.
+    ///
+    /// - `Closed` — every breaker is closed (or no addrs configured).
+    /// - `Open` — every breaker is open.
+    /// - `HalfOpen` — at least one is in half-open or breakers
+    ///   disagree (some closed, some open). The middle state means
+    ///   "the upstream is partially degraded"; admin dashboards
+    ///   surface it accordingly.
     pub fn breaker_state(&self) -> breaker::BreakerState {
-        self.breaker.snapshot()
+        if self.breakers.is_empty() {
+            return breaker::BreakerState::Closed;
+        }
+        let mut closed = 0usize;
+        let mut open = 0usize;
+        for b in self.breakers.iter() {
+            match b.snapshot() {
+                breaker::BreakerState::Closed => closed += 1,
+                breaker::BreakerState::Open => open += 1,
+                breaker::BreakerState::HalfOpen => {}
+            }
+        }
+        if closed == self.breakers.len() {
+            breaker::BreakerState::Closed
+        } else if open == self.breakers.len() {
+            breaker::BreakerState::Open
+        } else {
+            breaker::BreakerState::HalfOpen
+        }
     }
 
     /// Send `req` upstream and return the response. Body is buffered in
@@ -195,15 +238,6 @@ impl Upstream {
         B: BodyBytes + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        // Fail fast if the breaker is open. The check is two atomic
-        // loads — well below the per-request budget. A request that
-        // arrives during half-open is allowed; the next outcome
-        // (success/failure) decides whether the breaker re-arms or
-        // closes.
-        if matches!(self.breaker.check(), BreakerDecision::Reject) {
-            return Err(ForwardError::BreakerOpen);
-        }
-
         // Buffer the body so retries can replay it. P4 target workload
         // has <1 KB request bodies p95; the buffering cost is
         // negligible.
@@ -226,23 +260,36 @@ impl Upstream {
         parts.headers.remove(http::header::HOST);
 
         // Rewrite the URI to an absolute http:// URL pointing at the
-        // backend chosen by our load balancer (round-robin today).
-        if let Some(addr) = self.pick_addr() {
-            let path_and_query = parts
-                .uri
-                .path_and_query()
-                .map_or("/", http::uri::PathAndQuery::as_str)
-                .to_owned();
-            let new_uri: http::Uri = format!("http://{addr}{path_and_query}").parse().map_err(
-                |e: http::uri::InvalidUri| {
-                    ForwardError::Body(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        e.to_string(),
-                    )))
-                },
-            )?;
-            parts.uri = new_uri;
-        }
+        // backend chosen by our load balancer. `pick_addr` skips
+        // breaker-open backends; if every backend is open the request
+        // fails fast with BreakerOpen. With no configured addrs we
+        // fall back to whatever URI the request already carries (used
+        // by the test suite that drives Upstream with a fully-formed
+        // URI directly).
+        let addr_idx: Option<usize> = if self.addrs.is_empty() {
+            None
+        } else {
+            match self.pick_addr() {
+                Some((addr, idx)) => {
+                    let path_and_query = parts
+                        .uri
+                        .path_and_query()
+                        .map_or("/", http::uri::PathAndQuery::as_str)
+                        .to_owned();
+                    let new_uri: http::Uri = format!("http://{addr}{path_and_query}")
+                        .parse()
+                        .map_err(|e: http::uri::InvalidUri| {
+                            ForwardError::Body(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                e.to_string(),
+                            )))
+                        })?;
+                    parts.uri = new_uri;
+                    Some(idx)
+                }
+                None => return Err(ForwardError::BreakerOpen),
+            }
+        };
 
         let bytes = body
             .collect()
@@ -264,11 +311,7 @@ impl Upstream {
                             // for breaker purposes — the upstream is
                             // up but not serving. 2xx/3xx/4xx all reset
                             // the breaker.
-                            if last_status.is_server_error() {
-                                self.breaker.on_failure();
-                            } else {
-                                self.breaker.on_success();
-                            }
+                            self.observe_breaker_outcome(addr_idx, !last_status.is_server_error());
                             return Ok(resp);
                         }
                         RetryDecision::Retry => {
@@ -292,7 +335,7 @@ impl Upstream {
                         );
                         continue;
                     }
-                    self.breaker.on_failure();
+                    self.observe_breaker_outcome(addr_idx, false);
                     return Err(ForwardError::Client {
                         source: e,
                         connect_error,
@@ -302,8 +345,23 @@ impl Upstream {
         }
         // Loop exhausted retries without `Stop`-ing. Treat as failure
         // for breaker purposes too.
-        self.breaker.on_failure();
+        self.observe_breaker_outcome(addr_idx, false);
         Err(ForwardError::RetriesExhausted { last_status })
+    }
+
+    /// Record `success` (or failure) against the breaker for the addr
+    /// index that `pick_addr` returned. Indexless requests (test-only:
+    /// no addrs configured) are ignored.
+    fn observe_breaker_outcome(&self, idx: Option<usize>, success: bool) {
+        if let Some(i) = idx {
+            if let Some(b) = self.breakers.get(i) {
+                if success {
+                    b.on_success();
+                } else {
+                    b.on_failure();
+                }
+            }
+        }
     }
 }
 
@@ -319,13 +377,19 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// Strip the index off `pick_addr` for tests that only care
+    /// about the chosen address.
+    fn pick_a(u: &Upstream) -> Option<std::net::SocketAddr> {
+        u.pick_addr().map(|(a, _)| a)
+    }
+
     #[test]
     fn round_robin_picks_addrs_in_order() {
         let u = Upstream::with_addrs(
             RetryPolicy::none(),
             vec![sa("10.0.0.1:80"), sa("10.0.0.2:80"), sa("10.0.0.3:80")],
         );
-        let picks: Vec<_> = (0..6).map(|_| u.pick_addr().unwrap()).collect();
+        let picks: Vec<_> = (0..6).map(|_| pick_a(&u).unwrap()).collect();
         assert_eq!(
             picks,
             vec![
@@ -354,9 +418,31 @@ mod tests {
             vec![sa("10.0.0.1:80"), sa("10.0.0.2:80")],
         );
         let u2 = u.clone();
-        assert_eq!(u.pick_addr(), Some(sa("10.0.0.1:80")));
-        assert_eq!(u2.pick_addr(), Some(sa("10.0.0.2:80")));
-        assert_eq!(u.pick_addr(), Some(sa("10.0.0.1:80")));
-        assert_eq!(u2.pick_addr(), Some(sa("10.0.0.2:80")));
+        assert_eq!(pick_a(&u), Some(sa("10.0.0.1:80")));
+        assert_eq!(pick_a(&u2), Some(sa("10.0.0.2:80")));
+        assert_eq!(pick_a(&u), Some(sa("10.0.0.1:80")));
+        assert_eq!(pick_a(&u2), Some(sa("10.0.0.2:80")));
+    }
+
+    #[test]
+    fn pick_addr_skips_breaker_open_addrs() {
+        let u = Upstream::with_breaker(
+            RetryPolicy::none(),
+            vec![sa("10.0.0.1:80"), sa("10.0.0.2:80"), sa("10.0.0.3:80")],
+            BreakerConfig {
+                threshold: 1,
+                cooldown: Duration::from_secs(60),
+            },
+        );
+        // Trip addr 1 (10.0.0.2:80).
+        u.breakers[1].on_failure();
+        // Round-robin starts at 0 → picks .1; next pick should skip
+        // the open .2 and land on .3.
+        assert_eq!(pick_a(&u), Some(sa("10.0.0.1:80")));
+        assert_eq!(pick_a(&u), Some(sa("10.0.0.3:80")));
+        // Trip everything else; pick_addr returns None.
+        u.breakers[0].on_failure();
+        u.breakers[2].on_failure();
+        assert!(u.pick_addr().is_none());
     }
 }
