@@ -86,7 +86,21 @@ section accumulates work that hasn't tagged a release yet.
   - `conduit_responses_total{class="2xx|3xx|4xx|5xx"}`
   - `conduit_request_duration_seconds_*` histogram
     (Prometheus-default buckets, 1ms..10s + +Inf)
+  - `conduit_request_duration_seconds_by_class_*` — per-class
+    histogram so dashboards can split p99 of successes vs errors
+    with one PromQL query
   - `conduit_uptime_seconds`, `conduit_build_info`
+
+### Config validation hardening
+- `[upstream.tls]` with `client_cert` XOR `client_key` rejected at
+  load (mTLS needs both).
+- `[upstream.tls] verify = false` rejected unless
+  `CONDUIT_ALLOW_INSECURE_TLS=1` is set in the environment. Forces
+  deliberate opt-in instead of letting the "trust everything"
+  verifier sneak into a prod config.
+- `[upstream.health_check]` `interval = "0s"` / `timeout = "0s"`
+  rejected at load (would either spin the prober or fail every
+  probe).
 
 ### Binary
 - `conduit-config` strict TOML schema + validation.
@@ -127,8 +141,6 @@ in the project's `phaseN_deviations` notes:
 
 - **Streaming bodies** for the upstream client and H3 ingress (P8.x / P9.x).
 - **Per-leg read/write timeouts** beyond the connect timeout (P5.x.x).
-- **Active health probes for HTTPS** ✓ shipped — listed here for
-  earlier readers; remove on next release.
 - **OCSP stapling**, session-ID cache, certificate hot-reload (P6.x.x).
 - **0-RTT for QUIC** (P9.x).
 - **`h2spec` / `qlog` CI gates** (P7.x / P9.x).
