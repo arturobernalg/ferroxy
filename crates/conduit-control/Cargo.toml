@@ -4,9 +4,19 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Layer 6: config hot-reload, admin endpoints, metrics, logging, shutdown coordination."
+description = "Layer 6: admin endpoints, hot-reload (forthcoming), metrics (forthcoming)."
 
 [lints]
 workspace = true
 
 [dependencies]
+conduit-config = { workspace = true }
+
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

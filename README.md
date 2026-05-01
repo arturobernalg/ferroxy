@@ -34,8 +34,10 @@ What Conduit is **not**:
 ## Status
 
 Pre-1.0. Active development. Each phase of the build plan ships only after the full quality gate
-is green. The binary currently loads and validates a configuration and accepts plain TCP
-connections via the io layer; it cannot yet serve HTTP traffic.
+is green. The binary currently routes plain HTTP/1.1 traffic to a configured upstream — given a
+TOML config with a route and an upstream address, `conduit` will accept HTTP/1.1 connections,
+match each request against the route table, and forward to the selected backend. TLS, HTTP/2,
+HTTP/3, hot-reload, and the metrics endpoint arrive in their own phases.
 
 ## Supported Platforms
 

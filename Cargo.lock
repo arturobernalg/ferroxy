@@ -162,6 +162,7 @@ dependencies = [
  "bytes",
  "clap",
  "conduit-config",
+ "conduit-control",
  "conduit-h1",
  "conduit-io",
  "conduit-lifecycle",
@@ -170,6 +171,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "signal-hook",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -187,6 +189,17 @@ dependencies = [
 [[package]]
 name = "conduit-control"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "conduit-config",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "conduit-h1"

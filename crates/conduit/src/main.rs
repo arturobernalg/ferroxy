@@ -108,6 +108,13 @@ fn main() -> ExitCode {
     // the per-connection handler closures share one read-only copy.
     let dispatch = Arc::new(Dispatch::from_config(&cfg));
 
+    // Spawn the admin endpoint server on its own tokio runtime
+    // thread. Sharing the data-plane runtime would couple admin
+    // latency to data-plane scheduling pressure under load.
+    let admin_addr = cfg.server.admin_listen;
+    let admin_cancel = Arc::new(AtomicBool::new(false));
+    let admin_thread = spawn_admin_thread(admin_addr, Arc::clone(&admin_cancel));
+
     let dispatch_for_setup = Arc::clone(&dispatch);
     let server = match serve(spec, move || {
         let dispatch = Arc::clone(&dispatch_for_setup);
@@ -152,6 +159,12 @@ fn main() -> ExitCode {
         .expect("spawn signal handler thread");
 
     let report: ShutdownReport = server.wait();
+
+    // Stop the admin server too.
+    admin_cancel.store(true, Ordering::Release);
+    if let Some(h) = admin_thread {
+        let _ = h.join();
+    }
 
     signal_received.store(true, Ordering::Release);
     let _ = signal_thread.join();
@@ -233,6 +246,45 @@ fn error_response(status: StatusCode, body: &'static str) -> Response<conduit_pr
             body.as_bytes(),
         ))))
         .expect("build error response")
+}
+
+/// Spawn a dedicated OS thread running a single-threaded tokio
+/// runtime that hosts the admin HTTP/1.1 server. Decoupled from the
+/// data-plane runtime so admin latency does not bleed into the proxy
+/// hot path under load. Returns `None` if the thread could not be
+/// spawned (rare; the binary still starts and continues without
+/// admin endpoints, with a warning).
+fn spawn_admin_thread(
+    addr: std::net::SocketAddr,
+    cancel: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("conduit-admin-rt".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to build admin runtime");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                if let Err(e) = conduit_control::serve_admin(addr, cancel).await {
+                    tracing::error!(error = %e, "admin server failed");
+                }
+            });
+        })
+        .map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                "could not spawn admin thread; continuing without admin endpoints"
+            );
+            e
+        })
+        .ok()
 }
 
 fn resolve_workers(w: conduit_config::Workers) -> NonZeroUsize {
