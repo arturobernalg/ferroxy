@@ -8,25 +8,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
-  # Production target. Full quality gate plus integration tests.
+  # Production target — the full quality gate runs here. Cross-compile
+  # checks for the other Linux release targets live in the release
+  # workflow (which `cross` actually drives end-to-end against the
+  # build matrix the published artefacts need). CI's job is to catch
+  # regressions on the actual hot path; cross-compilation only
+  # exercises the build, not the runtime.
   linux:
-    name: linux (${{ matrix.target }})
+    name: linux (x86_64-unknown-linux-gnu)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-gnu
-          # aarch64-unknown-linux-musl temporarily skipped: monoio 0.2.4
-          # references `libc::statx` which is not exposed by libc 0.2.186
-          # on that target. Re-enable once monoio bumps to a version that
-          # avoids the symbol on musl targets, or once libc upstreams
-          # statx for aarch64-musl. Tracked in phase1_deviations.
     steps:
       - uses: actions/checkout@v4
 
@@ -34,43 +26,28 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: ${{ matrix.target }}
 
       - name: cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
-
-      - name: install cross-compilation tooling
-        if: matrix.target != 'x86_64-unknown-linux-gnu'
-        run: |
-          cargo install --locked cross
-          echo "CARGO=cross" >> "$GITHUB_ENV"
+          key: linux-gnu
 
       - name: install cargo-deny
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo install --locked cargo-deny
 
       - name: cargo build
-        run: ${{ env.CARGO || 'cargo' }} build --workspace --all-targets --release --target ${{ matrix.target }}
+        run: cargo build --workspace --all-targets --release
 
       - name: cargo test
-        # Only run tests on the host architecture (cross-arch test
-        # execution requires qemu and is brittle). Build still verifies
-        # the cross-compile.
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --workspace --target ${{ matrix.target }}
+        run: cargo test --workspace
 
       - name: cargo clippy
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo fmt
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo fmt --all -- --check
 
       - name: cargo deny
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo deny check
 
   # Development target. Cross-platform compile path, no integration
