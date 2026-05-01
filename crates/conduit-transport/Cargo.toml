@@ -4,9 +4,17 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Layer 2: TLS termination, QUIC, ALPN dispatch."
+description = "Layer 2: TLS termination via rustls. QUIC + ALPN dispatch land in later phases."
 
 [lints]
 workspace = true
 
 [dependencies]
+conduit-config = { workspace = true }
+
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

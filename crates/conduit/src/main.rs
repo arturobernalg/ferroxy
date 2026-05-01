@@ -80,22 +80,16 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if !cfg.server.listen_https.is_empty() {
-        tracing::warn!(
-            count = cfg.server.listen_https.len(),
-            "HTTPS listeners ignored: TLS termination ships in phase 6",
-        );
-    }
     if !cfg.server.listen_h3.is_empty() {
         tracing::warn!(
             count = cfg.server.listen_h3.len(),
             "H3 listeners ignored: HTTP/3 ships in phase 9",
         );
     }
-    if cfg.server.listen_http.is_empty() {
+    if cfg.server.listen_http.is_empty() && cfg.server.listen_https.is_empty() {
         tracing::error!(
-            "no plain-HTTP listeners; phase 1 has nothing to serve. \
-             Add at least one entry to server.listen_http or wait for phase 6 (HTTPS).",
+            "no plain-HTTP or HTTPS listeners; nothing to serve. \
+             Add at least one entry to server.listen_http or server.listen_https.",
         );
         return ExitCode::from(78);
     }
@@ -108,6 +102,12 @@ fn main() -> ExitCode {
     // the per-connection handler closures share one read-only copy.
     let dispatch = Arc::new(Dispatch::from_config(&cfg));
 
+    // Spawn HTTPS listener if `[tls]` and `listen_https` are both
+    // configured. The HTTPS listener runs on its own tokio runtime
+    // thread so its TLS handshake cost does not interfere with the
+    // plaintext data-plane runtime under load.
+    let https_thread = spawn_https_thread(&cfg, &dispatch);
+
     // Spawn the admin endpoint server on its own tokio runtime
     // thread. Sharing the data-plane runtime would couple admin
     // latency to data-plane scheduling pressure under load.
@@ -115,54 +115,58 @@ fn main() -> ExitCode {
     let admin_cancel = Arc::new(AtomicBool::new(false));
     let admin_thread = spawn_admin_thread(admin_addr, Arc::clone(&admin_cancel));
 
-    let dispatch_for_setup = Arc::clone(&dispatch);
-    let server = match serve(spec, move || {
-        let dispatch = Arc::clone(&dispatch_for_setup);
-        // The setup closure runs once per accept loop and produces the
-        // connection-level handler. The handler hands the stream to
-        // conduit-h1's serve_connection with a per-request service
-        // that calls Dispatch::handle.
-        move |stream: conduit_io::TcpStream, peer: std::net::SocketAddr| {
-            let dispatch = Arc::clone(&dispatch);
-            async move {
-                tracing::debug!(?peer, "accepted connection");
-                let handler = move |req: http::Request<Incoming>| {
-                    let dispatch = Arc::clone(&dispatch);
-                    async move { proxy_one(&dispatch, req).await }
-                };
-                if let Err(e) = conduit_h1::serve_connection(stream, handler).await {
-                    tracing::warn!(?peer, error = %e, "connection ended with error");
-                }
+    let server = if cfg.server.listen_http.is_empty() {
+        None
+    } else {
+        match start_http_server(spec, Arc::clone(&dispatch)) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!(error = %e, "bind failed");
+                print_chain(&e);
+                return ExitCode::from(1);
             }
         }
-    }) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "bind failed");
-            print_chain(&e);
-            return ExitCode::from(1);
-        }
     };
-    tracing::info!(addrs = ?server.local_addrs(), "listening");
 
-    let trigger = server.shutdown_trigger();
+    let http_trigger = server.as_ref().map(conduit_io::Server::shutdown_trigger);
+    let https_cancel_for_signal = https_thread.as_ref().map(|(_, c)| Arc::clone(c));
+    let admin_cancel_for_signal = Arc::clone(&admin_cancel);
 
     // Signal handler thread: first SIGTERM/SIGINT triggers graceful
-    // shutdown. Subsequent signals fall through to the OS default
-    // disposition (process termination), which is the right escalation
-    // for an unresponsive shutdown.
+    // shutdown across the http data plane, the https data plane, and
+    // the admin server.
     let signal_received = Arc::new(AtomicBool::new(false));
     let signal_received_for_thread = Arc::clone(&signal_received);
     let signal_thread = std::thread::Builder::new()
         .name("conduit-signal".into())
-        .spawn(move || install_signal_handler(&trigger, &signal_received_for_thread))
+        .spawn(move || {
+            install_signal_handler(&signal_received_for_thread, move || {
+                if let Some(t) = http_trigger.as_ref() {
+                    t.cancel();
+                }
+                if let Some(c) = https_cancel_for_signal.as_ref() {
+                    c.store(true, Ordering::Release);
+                }
+                admin_cancel_for_signal.store(true, Ordering::Release);
+            });
+        })
         .expect("spawn signal handler thread");
 
-    let report: ShutdownReport = server.wait();
+    let report = match server {
+        Some(s) => s.wait(),
+        None => {
+            // No HTTP plane; just block on https/admin via thread joins.
+            ShutdownReport::default()
+        }
+    };
 
-    // Stop the admin server too.
+    // Stop admin + https.
     admin_cancel.store(true, Ordering::Release);
     if let Some(h) = admin_thread {
+        let _ = h.join();
+    }
+    if let Some((h, cancel)) = https_thread {
+        cancel.store(true, Ordering::Release);
         let _ = h.join();
     }
 
@@ -248,6 +252,70 @@ fn error_response(status: StatusCode, body: &'static str) -> Response<conduit_pr
         .expect("build error response")
 }
 
+/// Bind the plaintext-HTTP listeners and start the conduit-io serve
+/// loop. Each accepted TCP stream is handed to `conduit-h1::serve_connection`
+/// with a per-request service that calls `Dispatch::handle`.
+fn start_http_server(
+    spec: ServeSpec,
+    dispatch: Arc<Dispatch>,
+) -> Result<conduit_io::Server, conduit_io::BindError> {
+    let server = serve(spec, move || {
+        let dispatch = Arc::clone(&dispatch);
+        move |stream: conduit_io::TcpStream, peer: std::net::SocketAddr| {
+            let dispatch = Arc::clone(&dispatch);
+            async move {
+                tracing::debug!(?peer, "accepted connection");
+                let handler = move |req: http::Request<Incoming>| {
+                    let dispatch = Arc::clone(&dispatch);
+                    async move { proxy_one(&dispatch, req).await }
+                };
+                if let Err(e) = conduit_h1::serve_connection(stream, handler).await {
+                    tracing::warn!(?peer, error = %e, "connection ended with error");
+                }
+            }
+        }
+    })?;
+    tracing::info!(addrs = ?server.local_addrs(), "listening (http)");
+    Ok(server)
+}
+
+/// Spawn the HTTPS listener thread if `[tls]` is configured and at
+/// least one HTTPS listen address is set. Returns `None` if HTTPS is
+/// disabled or the TLS config could not be loaded; the binary
+/// continues with HTTP-only in that case.
+fn spawn_https_thread(
+    cfg: &conduit_config::Config,
+    dispatch: &Arc<Dispatch>,
+) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
+    if cfg.server.listen_https.is_empty() {
+        return None;
+    }
+    let Some(tls_cfg) = cfg.tls.as_ref() else {
+        tracing::error!(
+            count = cfg.server.listen_https.len(),
+            "HTTPS listeners configured but no [tls] section; ignoring",
+        );
+        return None;
+    };
+    let server_cfg = match conduit_transport::load_server_config(tls_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "TLS server config failed; HTTPS disabled");
+            return None;
+        }
+    };
+    let acceptor = conduit_transport::build_acceptor(server_cfg);
+    let dispatch_clone = Arc::clone(dispatch);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_clone = Arc::clone(&cancel);
+    let addrs = cfg.server.listen_https.clone();
+    let handle = std::thread::Builder::new()
+        .name("conduit-https-rt".into())
+        .spawn(move || run_https(addrs, acceptor, dispatch_clone, cancel_clone))
+        .expect("spawn https thread");
+    Some((handle, cancel))
+}
+
 /// Spawn a dedicated OS thread running a single-threaded tokio
 /// runtime that hosts the admin HTTP/1.1 server. Decoupled from the
 /// data-plane runtime so admin latency does not bleed into the proxy
@@ -295,8 +363,11 @@ fn resolve_workers(w: conduit_config::Workers) -> NonZeroUsize {
     }
 }
 
-/// Wait for SIGTERM or SIGINT, then trigger graceful shutdown.
-fn install_signal_handler(trigger: &conduit_io::ShutdownTrigger, parent_done: &AtomicBool) {
+/// Wait for SIGTERM or SIGINT, then run the supplied shutdown closure.
+/// `parent_done` short-circuits the wait so the parent thread can join
+/// the signal handler after a clean shutdown that did not come from a
+/// signal (e.g. an internal serve error).
+fn install_signal_handler(parent_done: &AtomicBool, on_signal: impl FnOnce()) {
     use signal_hook::consts::signal::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
@@ -321,8 +392,95 @@ fn install_signal_handler(trigger: &conduit_io::ShutdownTrigger, parent_done: &A
                 );
             }
         }
-        trigger.cancel();
+        on_signal();
     }
+}
+
+/// Drive the HTTPS listeners on a dedicated thread. Builds a
+/// multi-thread tokio runtime, binds each `listen_https` address, and
+/// accepts in a loop until `cancel` is set. Each accepted TCP stream
+/// is handed to `accept_tls` and then to `conduit-h1::serve_connection`
+/// — same per-request path as the plaintext listener, just with a TLS
+/// wrapper at the bottom of the stack.
+fn run_https(
+    addrs: Vec<std::net::SocketAddr>,
+    acceptor: conduit_transport::TlsAcceptor,
+    dispatch: Arc<Dispatch>,
+    cancel: Arc<AtomicBool>,
+) {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("conduit-https")
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build https runtime");
+            return;
+        }
+    };
+    rt.block_on(async move {
+        let mut listeners = Vec::with_capacity(addrs.len());
+        for addr in &addrs {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => {
+                    let local = l.local_addr().unwrap_or(*addr);
+                    tracing::info!(addr = %local, "listening (https)");
+                    listeners.push(l);
+                }
+                Err(e) => {
+                    tracing::error!(addr = %addr, error = %e, "https bind failed");
+                    return;
+                }
+            }
+        }
+
+        // One accept loop per listener. Each loop polls `cancel` between
+        // accepts via a short timeout so SIGTERM unblocks shutdown
+        // without waiting for the next connection.
+        let mut tasks = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let acceptor = acceptor.clone();
+            let dispatch = Arc::clone(&dispatch);
+            let cancel = Arc::clone(&cancel);
+            tasks.push(tokio::spawn(async move {
+                while !cancel.load(Ordering::Acquire) {
+                    let accept = listener.accept();
+                    let timed =
+                        tokio::time::timeout(std::time::Duration::from_millis(250), accept).await;
+                    let (stream, peer) = match timed {
+                        Ok(Ok(p)) => p,
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "https accept failed");
+                            continue;
+                        }
+                        Err(_) => continue, // timeout → recheck cancel
+                    };
+                    let acceptor = acceptor.clone();
+                    let dispatch = Arc::clone(&dispatch);
+                    tokio::spawn(async move {
+                        let tls = match conduit_transport::accept_tls(&acceptor, stream).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::debug!(?peer, error = %e, "tls handshake failed");
+                                return;
+                            }
+                        };
+                        let handler = move |req: http::Request<Incoming>| {
+                            let dispatch = Arc::clone(&dispatch);
+                            async move { proxy_one(&dispatch, req).await }
+                        };
+                        if let Err(e) = conduit_h1::serve_connection(tls, handler).await {
+                            tracing::warn!(?peer, error = %e, "https connection ended with error");
+                        }
+                    });
+                }
+            }));
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+    });
 }
 
 fn print_chain(err: &(dyn std::error::Error + 'static)) {
