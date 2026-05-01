@@ -3,7 +3,10 @@
 //! All three types share the same lifetime: they are constructed
 //! once at config load and consumed (read-only) on the hot path.
 //! The hot path performs:
-//!   1. `RouteTable::find(&host, &path)`  — O(routes), linear today
+//!   1. `RouteTable::find(&host, &path)`  — O(1) host bucket lookup,
+//!      then O(1) exact-path lookup or O(prefixes-per-bucket) longest
+//!      prefix scan. Buckets sort prefixes longest-first at construction
+//!      time so the scan returns the most-specific match.
 //!   2. `UpstreamMap::get(name)`          — O(1) hash lookup
 //!   3. `Upstream::forward(req)`          — async, real network I/O
 //!
@@ -65,54 +68,131 @@ impl Route {
             upstream: cfg.upstream.clone(),
         }
     }
+}
 
-    fn matches(&self, host: Option<&str>, path: &str) -> bool {
-        if let Some(want) = &self.host {
-            match host {
-                Some(got) if got.eq_ignore_ascii_case(want) => {}
-                _ => return false,
+/// Per-host bucket of routes, indexed for O(1) exact-path lookup and
+/// length-sorted prefix scanning.
+#[derive(Debug, Clone, Default)]
+struct HostBucket {
+    /// Exact-path routes, keyed by the literal path string.
+    by_exact: HashMap<String, Route>,
+    /// Prefix routes sorted by prefix length descending (most-specific
+    /// first), with declaration order preserved as the tie-breaker.
+    prefix_sorted: Vec<(String, Route)>,
+    /// The first `PathMatch::Any` route declared in this bucket, if any.
+    any: Option<Route>,
+}
+
+impl HostBucket {
+    /// Insert a route into the bucket. Per the charter's "first in
+    /// declaration order wins" rule, the first insertion at a given
+    /// exact-path / prefix / "any" slot keeps the slot.
+    fn insert(&mut self, r: Route) {
+        match &r.path {
+            PathMatch::Exact(p) => {
+                self.by_exact.entry(p.clone()).or_insert_with(|| r.clone());
+            }
+            PathMatch::Prefix(p) => {
+                if !self.prefix_sorted.iter().any(|(pp, _)| pp == p) {
+                    self.prefix_sorted.push((p.clone(), r.clone()));
+                }
+            }
+            PathMatch::Any => {
+                if self.any.is_none() {
+                    self.any = Some(r);
+                }
             }
         }
-        match &self.path {
-            PathMatch::Any => true,
-            PathMatch::Prefix(p) => path.starts_with(p.as_str()),
-            PathMatch::Exact(p) => path == p.as_str(),
+    }
+
+    /// Sort `prefix_sorted` longest-first. Stable so declaration order
+    /// breaks ties between prefixes of equal length.
+    fn finalise(&mut self) {
+        self.prefix_sorted
+            .sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+    }
+
+    fn find(&self, path: &str) -> Option<&Route> {
+        if let Some(r) = self.by_exact.get(path) {
+            return Some(r);
         }
+        for (prefix, r) in &self.prefix_sorted {
+            if path.starts_with(prefix.as_str()) {
+                return Some(r);
+            }
+        }
+        self.any.as_ref()
     }
 }
 
-/// Ordered list of [`Route`]s scanned in declaration order. First
-/// match wins.
-#[derive(Debug, Clone)]
+/// Routes grouped by host for O(1) host lookup, then O(1) exact-path
+/// or O(prefixes-per-host) longest-prefix selection. The wildcard
+/// bucket (`host = None`) is consulted as a fallback when the
+/// host-keyed bucket does not match.
+///
+/// Lookup semantics match the linear-scan implementation that
+/// preceded this: declaration order is the tie-breaker within a
+/// bucket, and host-keyed routes are preferred over wildcard routes
+/// for the same path.
+#[derive(Debug, Clone, Default)]
 pub struct RouteTable {
-    routes: Vec<Route>,
+    /// Routes whose `host` was a concrete string. Keys are stored
+    /// pre-lowercased so lookups can fold case in a single pass.
+    by_host: HashMap<String, HostBucket>,
+    /// Routes whose `host` was `None` — match any request host.
+    wildcard: HostBucket,
+    /// Total route count; cheap accessor for observability.
+    len: usize,
 }
 
 impl RouteTable {
-    /// Build from the validated config document. Routes are scanned
-    /// in the order they appear in `[[route]]` blocks — the same
-    /// order operators see in their config file.
+    /// Build from the validated config document. Routes are grouped
+    /// by host into buckets and indexed for O(1) host lookup.
     pub fn from_config(cfg: &conduit_config::Config) -> Self {
-        Self {
-            routes: cfg.routes.iter().map(Route::from_config).collect(),
+        let mut t = Self::default();
+        for r in cfg.routes.iter().map(Route::from_config) {
+            t.len += 1;
+            match r.host.as_deref() {
+                Some(h) => {
+                    let key = h.to_ascii_lowercase();
+                    t.by_host.entry(key).or_default().insert(r);
+                }
+                None => t.wildcard.insert(r),
+            }
         }
+        for bucket in t.by_host.values_mut() {
+            bucket.finalise();
+        }
+        t.wildcard.finalise();
+        t
     }
 
-    /// Find the first route that matches `(host, path)`. Returns
-    /// `None` if no route matches.
+    /// Find the route that matches `(host, path)`. Tries the
+    /// host-keyed bucket first (case-folded), then falls back to the
+    /// wildcard bucket. Within a bucket, exact > longest-prefix >
+    /// any. Returns `None` if no route matches.
     pub fn find(&self, host: Option<&str>, path: &str) -> Option<&Route> {
-        self.routes.iter().find(|r| r.matches(host, path))
+        if let Some(h) = host {
+            // ASCII-only fold; HTTP host names are ASCII.
+            let key = h.to_ascii_lowercase();
+            if let Some(bucket) = self.by_host.get(&key) {
+                if let Some(r) = bucket.find(path) {
+                    return Some(r);
+                }
+            }
+        }
+        self.wildcard.find(path)
     }
 
     /// Number of routes (for observability / tests).
     pub fn len(&self) -> usize {
-        self.routes.len()
+        self.len
     }
 
     /// `true` if the table has no routes. Reject at config-validate
     /// time, but cheap to expose.
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+        self.len == 0
     }
 }
 
@@ -273,7 +353,26 @@ mod tests {
     }
 
     fn table(routes: Vec<Route>) -> RouteTable {
-        RouteTable { routes }
+        let mut t = RouteTable {
+            by_host: HashMap::new(),
+            wildcard: HostBucket::default(),
+            len: 0,
+        };
+        for r in routes {
+            t.len += 1;
+            match r.host.as_deref() {
+                Some(h) => {
+                    let key = h.to_ascii_lowercase();
+                    t.by_host.entry(key).or_default().insert(r);
+                }
+                None => t.wildcard.insert(r),
+            }
+        }
+        for bucket in t.by_host.values_mut() {
+            bucket.finalise();
+        }
+        t.wildcard.finalise();
+        t
     }
 
     #[test]
@@ -334,6 +433,63 @@ mod tests {
         let t = table(vec![route(Some("a.com"), PathMatch::Any, "a")]);
         assert!(t.find(Some("b.com"), "/").is_none());
         assert!(t.find(None, "/").is_none());
+    }
+
+    #[test]
+    fn longest_prefix_wins_within_a_host_bucket() {
+        // Declaration order is shorter-first; the trie-equivalent
+        // bucket must still pick the longer (more specific) prefix.
+        let t = table(vec![
+            route(None, PathMatch::Prefix("/api/".into()), "api-root"),
+            route(None, PathMatch::Prefix("/api/v2/".into()), "api-v2"),
+            route(
+                None,
+                PathMatch::Prefix("/api/v2/admin/".into()),
+                "api-v2-admin",
+            ),
+        ]);
+        assert_eq!(t.find(None, "/api/health").unwrap().upstream, "api-root");
+        assert_eq!(t.find(None, "/api/v2/items").unwrap().upstream, "api-v2");
+        assert_eq!(
+            t.find(None, "/api/v2/admin/users").unwrap().upstream,
+            "api-v2-admin"
+        );
+    }
+
+    #[test]
+    fn exact_beats_prefix_within_a_bucket() {
+        let t = table(vec![
+            route(None, PathMatch::Prefix("/api/".into()), "api"),
+            route(None, PathMatch::Exact("/api/health".into()), "health"),
+        ]);
+        assert_eq!(
+            t.find(None, "/api/health").unwrap().upstream,
+            "health",
+            "exact match should beat prefix in the same bucket",
+        );
+        assert_eq!(t.find(None, "/api/users").unwrap().upstream, "api");
+    }
+
+    #[test]
+    fn host_keyed_routes_preferred_over_wildcard() {
+        let t = table(vec![
+            route(None, PathMatch::Prefix("/".into()), "fallback"),
+            route(
+                Some("api.example.com"),
+                PathMatch::Prefix("/".into()),
+                "api",
+            ),
+        ]);
+        // Host-keyed bucket finds a match; wildcard is not consulted.
+        assert_eq!(
+            t.find(Some("api.example.com"), "/x").unwrap().upstream,
+            "api",
+        );
+        // Unknown host falls back to wildcard.
+        assert_eq!(
+            t.find(Some("other.com"), "/x").unwrap().upstream,
+            "fallback"
+        );
     }
 
     #[test]
