@@ -125,6 +125,202 @@ pub struct Upstream {
 /// in-memory bodies; streaming forwarding is a P5/P8 concern.
 pub type BodyOf<D> = http_body_util::Full<D>;
 
+/// Per-upstream TLS overrides parsed from `[upstream.tls]`.
+/// All fields are optional; an empty struct is equivalent to
+/// "use system roots, no client cert, verify enabled".
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamTlsOptions {
+    /// PEM file with one or more CA certificates. Replaces the
+    /// bundled webpki root store for this upstream only. `None`
+    /// keeps the default roots.
+    pub ca: Option<std::path::PathBuf>,
+    /// PEM file holding the client certificate chain (mTLS).
+    /// Both `client_cert` and `client_key` must be set together;
+    /// supplying one without the other is a config error.
+    pub client_cert: Option<std::path::PathBuf>,
+    /// PEM file holding the client private key (mTLS).
+    pub client_key: Option<std::path::PathBuf>,
+    /// `true` keeps the standard verifier; `false` installs a
+    /// "trust everything" verifier. **Test environments only** —
+    /// the validator should reject `verify = false` in production
+    /// configs. Default `true`.
+    pub verify: bool,
+}
+
+/// Errors surfaced when building an upstream's TLS configuration.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TlsLoadError {
+    /// A configured PEM file could not be read.
+    #[error("read tls file `{path}`")]
+    ReadFile {
+        /// Path attempted.
+        path: std::path::PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// PEM file parsed empty or contained nothing of the expected kind.
+    #[error("file `{path}` did not yield any PEM items of the expected kind")]
+    EmptyPem {
+        /// Path that resolved empty.
+        path: std::path::PathBuf,
+    },
+    /// rustls' `ClientConfig::builder` rejected the cert + key pair.
+    #[error("rustls rejected client cert + key for upstream mTLS")]
+    Rustls(#[source] rustls::Error),
+    /// `client_cert` set without `client_key` (or vice-versa). The
+    /// validator catches this earlier; surfaced for safety.
+    #[error("upstream tls.client_cert and tls.client_key must both be set or both unset")]
+    MismatchedClientCert,
+}
+
+fn build_https_connector(
+    http: hyper_util::client::legacy::connect::HttpConnector,
+    tls: Option<UpstreamTlsOptions>,
+) -> Result<Connector, TlsLoadError> {
+    let Some(opts) = tls else {
+        // Default path: webpki root store, standard verifier.
+        return Ok(hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http));
+    };
+    let client_cfg = build_client_config(&opts)?;
+    Ok(hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(client_cfg)
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http))
+}
+
+fn build_client_config(opts: &UpstreamTlsOptions) -> Result<rustls::ClientConfig, TlsLoadError> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    // Root store: custom CA bundle if supplied, else the webpki bundle.
+    let mut roots = rustls::RootCertStore::empty();
+    if let Some(path) = opts.ca.as_ref() {
+        let bytes = std::fs::read(path).map_err(|source| TlsLoadError::ReadFile {
+            path: path.clone(),
+            source,
+        })?;
+        let mut added = 0usize;
+        for cert in CertificateDer::pem_slice_iter(&bytes) {
+            let cert = cert.map_err(|e| TlsLoadError::ReadFile {
+                path: path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            })?;
+            roots.add(cert).map_err(TlsLoadError::Rustls)?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(TlsLoadError::EmptyPem { path: path.clone() });
+        }
+    } else {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    // mTLS client cert + key. Both or neither.
+    let client_auth = match (opts.client_cert.as_ref(), opts.client_key.as_ref()) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_bytes = std::fs::read(cert_path).map_err(|source| TlsLoadError::ReadFile {
+                path: cert_path.clone(),
+                source,
+            })?;
+            let mut chain = Vec::new();
+            for c in CertificateDer::pem_slice_iter(&cert_bytes) {
+                chain.push(c.map_err(|e| TlsLoadError::ReadFile {
+                    path: cert_path.clone(),
+                    source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                })?);
+            }
+            if chain.is_empty() {
+                return Err(TlsLoadError::EmptyPem {
+                    path: cert_path.clone(),
+                });
+            }
+            let key_bytes = std::fs::read(key_path).map_err(|source| TlsLoadError::ReadFile {
+                path: key_path.clone(),
+                source,
+            })?;
+            let key =
+                PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| TlsLoadError::ReadFile {
+                    path: key_path.clone(),
+                    source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                })?;
+            Some((chain, key))
+        }
+        (None, None) => None,
+        _ => return Err(TlsLoadError::MismatchedClientCert),
+    };
+
+    // Build the ClientConfig.
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let mut cfg = if let Some((chain, key)) = client_auth {
+        builder
+            .with_client_auth_cert(chain, key)
+            .map_err(TlsLoadError::Rustls)?
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    // verify=false swaps in a "trust everything" verifier. Test
+    // environments only; the validator rejects it in production
+    // configs (P9.x.x — until then, accept and surface a warning).
+    if !opts.verify {
+        tracing::warn!("upstream tls.verify = false; cert validation disabled");
+        cfg.dangerous()
+            .set_certificate_verifier(Arc::new(InsecureVerifier));
+    }
+    Ok(cfg)
+}
+
+/// Permissive verifier for `tls.verify = false` test deployments.
+/// **Never** install this in production — it accepts any peer cert.
+#[derive(Debug)]
+struct InsecureVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+use std::sync::Arc;
+
 impl std::fmt::Debug for Upstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Upstream")
@@ -171,33 +367,42 @@ impl Upstream {
         breaker: BreakerConfig,
         connect_timeout: Option<Duration>,
     ) -> Self {
+        Self::with_tls(retry, addrs, breaker, connect_timeout, None)
+            .expect("default rustls config never fails to build")
+    }
+
+    /// Full constructor with optional per-upstream TLS. When
+    /// `tls = Some(cfg)` the upstream's `Client` is built against a
+    /// custom rustls `ClientConfig`: optional custom CA bundle,
+    /// optional mTLS client cert+key, optional verifier-disable
+    /// (testing only). When `tls = None` the bundled webpki root
+    /// store and standard verifier are used.
+    ///
+    /// Returns `Err(TlsLoadError)` only when a supplied path is
+    /// unreadable or a PEM file does not parse; the rustls
+    /// `ClientConfig` builder itself never fails for valid input.
+    pub fn with_tls(
+        retry: RetryPolicy,
+        addrs: Vec<std::net::SocketAddr>,
+        breaker: BreakerConfig,
+        connect_timeout: Option<Duration>,
+        tls: Option<UpstreamTlsOptions>,
+    ) -> Result<Self, TlsLoadError> {
         let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
         http.enforce_http(false); // allow `https://` URIs
         if let Some(d) = connect_timeout {
             http.set_connect_timeout(Some(d));
         }
-        // Default rustls ClientConfig: webpki-tokio-bundled root
-        // store, TLS 1.2 + 1.3, ALPN advertising http/1.1 and h2.
-        // Per-upstream TLS overrides (custom CA, mTLS,
-        // insecure_skip_verify) are P9.x scope; they require building
-        // a per-upstream Client which the current shared-Client
-        // pattern does not yet support.
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(http);
+        let connector = build_https_connector(http, tls)?;
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        // One breaker per addr. Vec → Arc<[T]> avoids per-request
-        // refcount work; the breakers themselves are interior-mutable.
         let breakers: Vec<Breaker> = (0..addrs.len()).map(|_| Breaker::new(breaker)).collect();
-        Self {
+        Ok(Self {
             client,
             retry,
             addrs: addrs.into(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             breakers: breakers.into(),
-        }
+        })
     }
 
     /// Pick the next backend address. Starts the round-robin scan at

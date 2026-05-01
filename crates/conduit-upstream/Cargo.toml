@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 hyper-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

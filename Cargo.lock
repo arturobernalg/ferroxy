@@ -453,6 +453,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

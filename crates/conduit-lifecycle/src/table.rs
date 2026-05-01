@@ -333,15 +333,37 @@ impl UpstreamMap {
             // total timeout is a separate, larger budget owned by the
             // dispatcher.
             let connect: std::time::Duration = u.connect_timeout.into();
-            map.insert(
-                u.name.clone(),
-                Upstream::with_options(
-                    conduit_upstream::RetryPolicy::default(),
-                    u.addrs.clone(),
-                    conduit_upstream::BreakerConfig::default(),
-                    Some(connect),
-                ),
-            );
+            // Translate the schema's `[upstream.tls]` block into the
+            // hot-path types. `None` → default verifier + webpki
+            // roots. Failures loading per-upstream PEMs log + skip
+            // the upstream rather than half-load it.
+            let tls_opts = u
+                .tls
+                .as_ref()
+                .map(|t| conduit_upstream::UpstreamTlsOptions {
+                    ca: t.ca.clone(),
+                    client_cert: t.client_cert.clone(),
+                    client_key: t.client_key.clone(),
+                    verify: t.verify,
+                });
+            let upstream = match Upstream::with_tls(
+                conduit_upstream::RetryPolicy::default(),
+                u.addrs.clone(),
+                conduit_upstream::BreakerConfig::default(),
+                Some(connect),
+                tls_opts,
+            ) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::error!(
+                        upstream = %u.name,
+                        error = %e,
+                        "failed to build upstream TLS config; skipping",
+                    );
+                    continue;
+                }
+            };
+            map.insert(u.name.clone(), upstream);
         }
         map
     }
