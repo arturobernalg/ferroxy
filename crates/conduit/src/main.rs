@@ -26,8 +26,7 @@ use bytes::Bytes;
 use clap::Parser;
 use conduit_io::{serve, ServeSpec, ShutdownReport};
 use conduit_lifecycle::Dispatch;
-use conduit_proto::{boxed, Response, StatusCode, VecBody};
-use http_body_util::BodyExt;
+use conduit_proto::{Response, StatusCode, VecBody};
 use hyper::body::Incoming;
 
 /// Live dispatch table — hot-swapped under SIGHUP. The hot path
@@ -202,7 +201,7 @@ async fn proxy_one<B>(
     dispatch: &Dispatch,
     metrics: &conduit_control::MetricsHandle,
     req: http::Request<B>,
-) -> Result<Response<conduit_proto::BoxBody>, Infallible>
+) -> Result<Response<ProxyBody>, Infallible>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -235,16 +234,10 @@ where
         Ok(resp) => {
             metrics.observe_status(resp.status().as_u16());
             let (parts, body) = resp.into_parts();
-            // Erase hyper::body::Incoming → BoxBody so the binary
-            // returns one concrete body type regardless of which
-            // upstream produced the bytes. Cold path; one box per
-            // request — the per-request hot-path no-allocation rule
-            // is met inside conduit-upstream's request loop.
-            let body: conduit_proto::BoxBody = BodyExt::boxed(BodyExt::map_err(body, |e| {
-                let b: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
-                b
-            }));
-            Ok(Response::from_parts(parts, body))
+            // Wrap the upstream's body in our concrete enum instead
+            // of allocating a Box<dyn Body>. Saves one heap
+            // allocation per request on the success path.
+            Ok(Response::from_parts(parts, ProxyBody::Upstream(body)))
         }
         Err(conduit_lifecycle::DispatchError::NoRoute) => {
             tracing::debug!("no route matched");
@@ -304,14 +297,64 @@ where
     }
 }
 
-fn error_response(status: StatusCode, body: &'static str) -> Response<conduit_proto::BoxBody> {
+fn error_response(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain")
-        .body(boxed(VecBody::from_bytes(Bytes::from_static(
-            body.as_bytes(),
-        ))))
+        .body(ProxyBody::Synthetic(VecBody::from_bytes(
+            Bytes::from_static(body.as_bytes()),
+        )))
         .expect("build error response")
+}
+
+/// Body returned by [`proxy_one`]. Concrete enum (not `BoxBody`) so
+/// the per-request happy path doesn't pay for a `Box<dyn Body>`
+/// allocation. Two variants cover every shape conduit produces:
+///
+/// - `Upstream` — bytes streamed back from the real backend.
+/// - `Synthetic` — error pages or admin replies built in-memory.
+///
+/// `Self::Error` is `BoxError` so callers don't have to thread the
+/// hyper error type. `Synthetic`'s body is `Infallible` and is
+/// promoted into `BoxError` at the match site (a never-taken arm).
+enum ProxyBody {
+    Upstream(Incoming),
+    Synthetic(VecBody),
+}
+
+impl http_body::Body for ProxyBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        // SAFETY-equivalent: `get_mut` requires `Self: Unpin`. Both
+        // `Incoming` and `VecBody` are `Unpin`, so this enum is too.
+        match self.get_mut() {
+            ProxyBody::Upstream(b) => std::pin::Pin::new(b)
+                .poll_frame(cx)
+                .map(|opt| opt.map(|r| r.map_err(|e| Box::new(e) as _))),
+            ProxyBody::Synthetic(b) => std::pin::Pin::new(b)
+                .poll_frame(cx)
+                .map(|opt| opt.map(|r| r.map_err(|never| match never {}))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            ProxyBody::Upstream(b) => b.is_end_stream(),
+            ProxyBody::Synthetic(b) => b.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            ProxyBody::Upstream(b) => b.size_hint(),
+            ProxyBody::Synthetic(b) => b.size_hint(),
+        }
+    }
 }
 
 /// Bind the plaintext-HTTP listeners and start the conduit-io serve

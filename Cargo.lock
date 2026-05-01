@@ -294,6 +294,7 @@ dependencies = [
  "conduit-transport",
  "conduit-upstream",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "quinn",
