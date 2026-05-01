@@ -153,6 +153,25 @@ each independently small but stacking up. See
   URI rewrites just clone (refcount bump on the inner `Bytes`)
   instead of running `addr.to_string()` + parse on every call.
 
+### Per-worker tokio backend
+
+`conduit-io::tokio_worker` was a single multi-thread runtime
+sharing one accept loop per listener and one
+`hyper-util::Client` across every worker. Replaced with N OS
+threads, one per worker, each running its own current-thread
+tokio runtime. Listeners are bound N times per address with
+`SO_REUSEPORT` so the kernel distributes connections across
+workers; `setup()` is called once per worker per listener so
+handlers can capture per-worker state.
+
+The two backends (tokio + monoio) now differ only in runtime
+builder, listener type, and counter type — same per-worker shape
+otherwise. This unblocks per-worker Client / per-worker pool
+sharding (next step in the deferred section).
+
+Smoke-tested with workers=4 and 20 concurrent requests: all 20
+served, metrics agree.
+
 ### Per-leg read timeout (`TimedBody`)
 
 `Upstream::forward` now wraps the upstream's response body with
@@ -213,8 +232,14 @@ in the project's `phaseN_deviations` notes:
 - **monoio↔tokio bridge** so the binary can drive monoio's io_uring
   backend through hyper (P3.x).
 - **bumpalo per-request arena** for header storage (P3.x).
-- **Per-worker connection-pool sharding** to replace hyper-util's
-  shared `legacy::Client` (P4.x; gated on a P11.5 profile).
+- **Per-worker connection-pool sharding inside `Upstream`**: the
+  tokio worker model is now per-worker (each worker a current-thread
+  runtime; SO_REUSEPORT across N binders); the next step is making
+  `Upstream::client` per-worker so each shard owns its own pool.
+  Today the Client is still globally shared via `Arc`, so workers
+  contend on its internal `Mutex<Pool>`. Plumbing in
+  `Dispatch::from_config` for per-worker `Upstream` lands when this
+  ships.
 - **OpenTelemetry tracing** with W3C `traceparent` propagation
   (P10.x.x).
 - **Real benchmark numbers vs nginx / Pingora** — gated on a real
