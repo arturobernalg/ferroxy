@@ -30,7 +30,7 @@
 mod breaker;
 mod retry;
 
-pub use breaker::{Breaker, BreakerConfig, Decision as BreakerDecision};
+pub use breaker::{Breaker, BreakerConfig, BreakerState, Decision as BreakerDecision};
 pub use retry::{RetryDecision, RetryPolicy};
 
 use std::time::Duration;
@@ -171,6 +171,12 @@ impl Upstream {
     /// Backend addresses (read-only).
     pub fn addrs(&self) -> &[std::net::SocketAddr] {
         &self.addrs
+    }
+
+    /// Snapshot of the breaker's current state. Cheap; two atomic
+    /// loads. Useful for admin / metrics exposition.
+    pub fn breaker_state(&self) -> breaker::BreakerState {
+        self.breaker.snapshot()
     }
 
     /// Send `req` upstream and return the response. Body is buffered in

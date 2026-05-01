@@ -106,17 +106,7 @@ fn main() -> ExitCode {
     // lock on the hot path. Each request loads a snapshot Arc once.
     let dispatch: DispatchSwap = Arc::new(ArcSwap::new(Arc::new(Dispatch::from_config(&cfg))));
 
-    // SIGHUP-driven hot-reload: re-read the config from disk on each
-    // signal and atomically swap the live Dispatch. New requests see
-    // the new routes/upstreams; in-flight requests keep their old
-    // snapshot. Shutdown (sigterm/sigint) propagates via `done` so the
-    // reload thread doesn't outlive the data plane.
-    let reload_done = Arc::new(AtomicBool::new(false));
-    let reload_thread = spawn_reload_thread(
-        cli.config.clone(),
-        Arc::clone(&dispatch),
-        Arc::clone(&reload_done),
-    );
+    let (reload_done, reload_thread) = start_reload(&cli.config, &dispatch);
 
     // Single shared metrics sink. Every per-request handler bumps
     // counters on it via `fetch_add(_, Relaxed)`; the admin server
@@ -138,8 +128,12 @@ fn main() -> ExitCode {
     // latency to data-plane scheduling pressure under load.
     let admin_addr = cfg.server.admin_listen;
     let admin_cancel = Arc::new(AtomicBool::new(false));
-    let admin_thread =
-        spawn_admin_thread(admin_addr, Arc::clone(&admin_cancel), Arc::clone(&metrics));
+    let admin_thread = spawn_admin_thread(
+        admin_addr,
+        Arc::clone(&admin_cancel),
+        Arc::clone(&metrics),
+        upstreams_renderer(&dispatch),
+    );
 
     let server = if cfg.server.listen_http.is_empty() {
         None
@@ -376,6 +370,7 @@ fn spawn_admin_thread(
     addr: std::net::SocketAddr,
     cancel: Arc<AtomicBool>,
     metrics: Arc<conduit_control::MetricsHandle>,
+    upstreams: conduit_control::UpstreamsRenderer,
 ) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("conduit-admin-rt".into())
@@ -391,7 +386,9 @@ fn spawn_admin_thread(
                 }
             };
             rt.block_on(async move {
-                if let Err(e) = conduit_control::serve_admin(addr, cancel, metrics).await {
+                if let Err(e) =
+                    conduit_control::serve_admin(addr, cancel, metrics, Some(upstreams)).await
+                {
                     tracing::error!(error = %e, "admin server failed");
                 }
             });
@@ -558,6 +555,20 @@ fn run_https(
             let _ = t.await;
         }
     });
+}
+
+/// SIGHUP-driven hot-reload setup: spawn the reload thread and
+/// return its `done` flag (flipped on shutdown to break the wait)
+/// together with the join handle. Re-reads the config from `path` on
+/// each signal and atomically swaps the live Dispatch. In-flight
+/// requests keep their old snapshot.
+fn start_reload(
+    path: &Path,
+    dispatch: &DispatchSwap,
+) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let handle = spawn_reload_thread(path.to_path_buf(), Arc::clone(dispatch), Arc::clone(&done));
+    (done, handle)
 }
 
 /// Spawn a thread that listens for SIGHUP and atomically swaps the
@@ -814,6 +825,51 @@ fn run_h3(
             let _ = t.await;
         }
     });
+}
+
+/// Build a renderer thunk that walks the live `Dispatch` (loaded from
+/// the shared `ArcSwap` on each scrape, so SIGHUP reloads are
+/// reflected immediately) and produces the `/upstreams` body.
+fn upstreams_renderer(dispatch: &DispatchSwap) -> conduit_control::UpstreamsRenderer {
+    let dispatch = Arc::clone(dispatch);
+    Arc::new(move || render_upstreams(&dispatch.load_full()))
+}
+
+/// Render the `/upstreams` admin response body. Plain text, one line
+/// per upstream, e.g.:
+///
+/// ```text
+/// upstream api  addrs=["10.0.0.1:8080","10.0.0.2:8080"]  breaker=closed
+/// upstream static  addrs=["10.0.0.10:8080"]              breaker=open
+/// ```
+fn render_upstreams(d: &Dispatch) -> String {
+    let mut entries: Vec<(&str, &conduit_upstream::Upstream)> = d.upstreams().iter().collect();
+    entries.sort_by_key(|(name, _)| *name);
+    let mut out = String::with_capacity(entries.len() * 80);
+    for (name, u) in entries {
+        out.push_str("upstream ");
+        out.push_str(name);
+        out.push_str(" addrs=[");
+        for (i, a) in u.addrs().iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(&a.to_string());
+            out.push('"');
+        }
+        out.push_str("] breaker=");
+        out.push_str(match u.breaker_state() {
+            conduit_upstream::BreakerState::Closed => "closed",
+            conduit_upstream::BreakerState::Open => "open",
+            conduit_upstream::BreakerState::HalfOpen => "half_open",
+        });
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str("(no upstreams)\n");
+    }
+    out
 }
 
 fn print_chain(err: &(dyn std::error::Error + 'static)) {

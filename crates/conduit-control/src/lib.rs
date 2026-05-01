@@ -37,5 +37,5 @@
 mod admin;
 mod metrics;
 
-pub use admin::{serve_admin, AdminError};
+pub use admin::{serve_admin, AdminError, UpstreamsRenderer};
 pub use metrics::MetricsHandle;

@@ -19,6 +19,11 @@ use tokio::net::TcpListener;
 
 use crate::metrics::MetricsHandle;
 
+/// A thunk that renders the `/upstreams` endpoint body. The binary
+/// supplies it because the admin crate cannot reach into
+/// `conduit-lifecycle` without inverting the layer model.
+pub type UpstreamsRenderer = Arc<dyn Fn() -> String + Send + Sync>;
+
 /// Process start time, captured the first time the admin server is
 /// asked to render `/metrics`. Stored as `Option<Instant>` behind a
 /// `OnceLock` so unit tests that build responses without first
@@ -57,6 +62,7 @@ pub async fn serve_admin(
     addr: SocketAddr,
     cancel: Arc<AtomicBool>,
     metrics: Arc<MetricsHandle>,
+    upstreams_renderer: Option<UpstreamsRenderer>,
 ) -> Result<(), AdminError> {
     // Anchor the uptime gauge from the moment the admin server binds.
     let _ = process_start();
@@ -73,11 +79,13 @@ pub async fn serve_admin(
         match tokio::time::timeout(poll, listener.accept()).await {
             Ok(Ok((stream, peer))) => {
                 let metrics = Arc::clone(&metrics);
+                let renderer = upstreams_renderer.clone();
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
                     let svc = service_fn(move |req: Request<Incoming>| {
                         let metrics = Arc::clone(&metrics);
-                        async move { Ok::<_, Infallible>(handle(&req, &metrics)) }
+                        let renderer = renderer.clone();
+                        async move { Ok::<_, Infallible>(handle(&req, &metrics, renderer.as_ref())) }
                     });
                     if let Err(e) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, svc)
@@ -101,17 +109,35 @@ pub async fn serve_admin(
 /// Per-request handler. Sync — every admin endpoint completes
 /// without awaiting; the async wrapper at the call site keeps the
 /// hyper `service_fn` signature happy.
-fn handle(req: &Request<Incoming>, metrics: &MetricsHandle) -> Response<Full<Bytes>> {
+fn handle(
+    req: &Request<Incoming>,
+    metrics: &MetricsHandle,
+    upstreams: Option<&UpstreamsRenderer>,
+) -> Response<Full<Bytes>> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/health") => plain_text(StatusCode::OK, "ok\n"),
         (&Method::GET, "/ready") => plain_text(StatusCode::OK, "ready\n"),
         (&Method::GET, "/metrics") => metrics_response(metrics),
+        (&Method::GET, "/upstreams") => match upstreams {
+            Some(r) => plain_text_owned(StatusCode::OK, r()),
+            None => plain_text(StatusCode::NOT_FOUND, "not found\n"),
+        },
         (&Method::GET, "/") => plain_text(
             StatusCode::OK,
-            "conduit admin\nendpoints: /health /ready /metrics\n",
+            "conduit admin\nendpoints: /health /ready /metrics /upstreams\n",
         ),
         _ => plain_text(StatusCode::NOT_FOUND, "not found\n"),
     }
+}
+
+/// Like `plain_text` but for an owned string — the renderer produces
+/// a fresh string every call.
+fn plain_text_owned(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(body)))
+        .expect("owned admin response builder")
 }
 
 /// Render the Prometheus 0.0.4 text-format exposition: synthetic

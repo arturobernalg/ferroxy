@@ -31,6 +31,18 @@ pub enum Decision {
     Reject,
 }
 
+/// Snapshot of breaker state, suitable for an admin / metrics
+/// endpoint. Returned by [`Breaker::snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerState {
+    /// Below the failure threshold; requests pass through.
+    Closed,
+    /// Tripped and within cooldown; requests are rejected.
+    Open,
+    /// Tripped and cooldown elapsed; the next request acts as a probe.
+    HalfOpen,
+}
+
 /// Configuration for [`Breaker::new`]. `threshold = 0` disables the
 /// breaker entirely (every check returns `Allow`).
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +121,21 @@ impl Breaker {
             Decision::Allow
         } else {
             Decision::Reject
+        }
+    }
+
+    /// Read the current state. Cheap; two atomic loads. Useful for
+    /// admin / metrics exposition; do not gate the hot path on this —
+    /// use [`Breaker::check`] there.
+    pub fn snapshot(&self) -> BreakerState {
+        if self.threshold == 0 || self.failures.load(Ordering::Relaxed) < self.threshold {
+            return BreakerState::Closed;
+        }
+        let open_until = self.open_until_ms.load(Ordering::Relaxed);
+        if open_until == 0 || self.now_ms() >= open_until {
+            BreakerState::HalfOpen
+        } else {
+            BreakerState::Open
         }
     }
 

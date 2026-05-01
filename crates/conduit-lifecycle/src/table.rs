@@ -258,6 +258,12 @@ impl UpstreamMap {
         self.by_name.insert(name.into(), upstream)
     }
 
+    /// Iterate `(name, upstream)` pairs in arbitrary order. Used by
+    /// the admin server to render the live pool stats endpoint.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Upstream)> {
+        self.by_name.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Look up an upstream by name. Cheap (`HashMap` get).
     pub fn get(&self, name: &str) -> Option<&Upstream> {
         self.by_name.get(name)
@@ -310,6 +316,17 @@ impl Dispatch {
         Self {
             inner: Arc::new(DispatchInner { routes, upstreams }),
         }
+    }
+
+    /// Read-only access to the upstream map. Used by the admin server
+    /// to render `/upstreams`.
+    pub fn upstreams(&self) -> &UpstreamMap {
+        &self.inner.upstreams
+    }
+
+    /// Read-only access to the route table.
+    pub fn routes(&self) -> &RouteTable {
+        &self.inner.routes
     }
 
     /// Build from a validated config document end-to-end.
