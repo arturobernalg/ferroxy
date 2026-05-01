@@ -115,4 +115,38 @@ pub enum ConfigError {
         /// Zero-based index of the route in the routes table.
         index: usize,
     },
+
+    /// `[upstream.tls]` set `client_cert` without `client_key` (or
+    /// vice-versa). mTLS requires both.
+    #[error(
+        "upstream `{name}` tls.client_cert and tls.client_key must both be set, or both unset"
+    )]
+    UpstreamMtlsMismatch {
+        /// Name of the offending upstream.
+        name: String,
+    },
+
+    /// `[upstream.tls]` set `verify = false` without the
+    /// `CONDUIT_ALLOW_INSECURE_TLS=1` environment variable. The
+    /// "trust everything" verifier must be opted into explicitly so
+    /// it can't sneak into a production deployment.
+    #[error(
+        "upstream `{name}` tls.verify = false rejected; set \
+         CONDUIT_ALLOW_INSECURE_TLS=1 in the environment to allow"
+    )]
+    UpstreamInsecureTlsNotOptedIn {
+        /// Name of the offending upstream.
+        name: String,
+    },
+
+    /// `[upstream.health_check]` had a non-positive interval or timeout.
+    /// A zero interval would spin the prober as fast as the runtime
+    /// allows; a zero timeout would mark every probe as failed.
+    #[error("upstream `{name}` health_check.{field} must be > 0")]
+    HealthCheckBadDuration {
+        /// Name of the offending upstream.
+        name: String,
+        /// Field whose value was non-positive (`interval` or `timeout`).
+        field: &'static str,
+    },
 }

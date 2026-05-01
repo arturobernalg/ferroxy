@@ -20,18 +20,34 @@ use crate::schema::Config;
 
 /// Run every semantic check. Logic checks first, then filesystem.
 pub(crate) fn check(cfg: &Config) -> Result<(), ConfigError> {
-    check_logic(cfg)?;
+    let opts = ValidationOptions {
+        allow_insecure_tls: std::env::var_os("CONDUIT_ALLOW_INSECURE_TLS")
+            .is_some_and(|v| v == "1"),
+    };
+    check_logic(cfg, opts)?;
     check_filesystem(cfg)?;
     Ok(())
 }
 
+/// Knobs for the logic-only validation pass that can't come from
+/// the config file itself (because the choice has security
+/// implications and the operator must have made it deliberately).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ValidationOptions {
+    /// Permit `[upstream.tls] verify = false`. Set from
+    /// `CONDUIT_ALLOW_INSECURE_TLS=1` at the public entry point;
+    /// tests construct this directly.
+    pub(crate) allow_insecure_tls: bool,
+}
+
 /// Pure, in-memory validation. No I/O.
-fn check_logic(cfg: &Config) -> Result<(), ConfigError> {
+fn check_logic(cfg: &Config, opts: ValidationOptions) -> Result<(), ConfigError> {
     if cfg.routes.is_empty() {
         return Err(ConfigError::NoRoutes);
     }
 
-    // Upstream addresses present, names unique.
+    // Upstream addresses present, names unique, mTLS pair sane,
+    // verify=false explicitly opted into, health-check durations > 0.
     let mut seen_names: HashSet<&str> = HashSet::with_capacity(cfg.upstreams.len());
     for (i, u) in cfg.upstreams.iter().enumerate() {
         if u.addrs.is_empty() {
@@ -44,6 +60,37 @@ fn check_logic(cfg: &Config) -> Result<(), ConfigError> {
             return Err(ConfigError::DuplicateUpstream {
                 name: u.name.clone(),
             });
+        }
+        if let Some(tls) = &u.tls {
+            // mTLS pair: both or neither.
+            if tls.client_cert.is_some() != tls.client_key.is_some() {
+                return Err(ConfigError::UpstreamMtlsMismatch {
+                    name: u.name.clone(),
+                });
+            }
+            // verify=false is opt-in via env. Memory note from
+            // 2026-05-01 user feedback: never let an "InsecureVerifier"
+            // sneak into a prod config silently.
+            if !tls.verify && !opts.allow_insecure_tls {
+                return Err(ConfigError::UpstreamInsecureTlsNotOptedIn {
+                    name: u.name.clone(),
+                });
+            }
+        }
+        if let Some(hc) = &u.health_check {
+            let zero = std::time::Duration::ZERO;
+            if std::time::Duration::from(hc.interval) == zero {
+                return Err(ConfigError::HealthCheckBadDuration {
+                    name: u.name.clone(),
+                    field: "interval",
+                });
+            }
+            if std::time::Duration::from(hc.timeout) == zero {
+                return Err(ConfigError::HealthCheckBadDuration {
+                    name: u.name.clone(),
+                    field: "timeout",
+                });
+            }
         }
     }
 
@@ -117,8 +164,12 @@ mod tests {
     use super::*;
 
     fn parse_logic(toml_text: &str) -> Result<Config, ConfigError> {
+        parse_logic_with(toml_text, ValidationOptions::default())
+    }
+
+    fn parse_logic_with(toml_text: &str, opts: ValidationOptions) -> Result<Config, ConfigError> {
         let cfg: Config = toml::from_str(toml_text)?;
-        check_logic(&cfg)?;
+        check_logic(&cfg, opts)?;
         Ok(cfg)
     }
 
@@ -387,5 +438,94 @@ made_up_field = 1
 "#;
         let r: Result<Config, _> = toml::from_str(toml);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn upstream_mtls_pair_required() {
+        let toml = r#"
+[server]
+admin_listen = "127.0.0.1:9090"
+metrics_listen = "127.0.0.1:9091"
+listen_http = ["0.0.0.0:80"]
+
+[[upstream]]
+name = "api"
+addrs = ["10.0.0.1:8080"]
+protocol = "http1"
+[upstream.tls]
+client_cert = "/etc/conduit/c.pem"
+verify = true
+
+[[route]]
+match = { host = "example.com" }
+upstream = "api"
+"#;
+        assert!(matches!(
+            parse_logic(toml),
+            Err(ConfigError::UpstreamMtlsMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn upstream_insecure_tls_requires_env_opt_in() {
+        let toml = r#"
+[server]
+admin_listen = "127.0.0.1:9090"
+metrics_listen = "127.0.0.1:9091"
+listen_http = ["0.0.0.0:80"]
+
+[[upstream]]
+name = "api"
+addrs = ["10.0.0.1:8080"]
+protocol = "http1"
+[upstream.tls]
+verify = false
+
+[[route]]
+match = { host = "example.com" }
+upstream = "api"
+"#;
+        // Default options: insecure TLS rejected.
+        assert!(matches!(
+            parse_logic(toml),
+            Err(ConfigError::UpstreamInsecureTlsNotOptedIn { .. })
+        ));
+        // Opt-in flag set: same config validates.
+        let result = parse_logic_with(
+            toml,
+            ValidationOptions {
+                allow_insecure_tls: true,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "with opt-in, should validate; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn health_check_zero_interval_rejected() {
+        let toml = r#"
+[server]
+admin_listen = "127.0.0.1:9090"
+metrics_listen = "127.0.0.1:9091"
+listen_http = ["0.0.0.0:80"]
+
+[[upstream]]
+name = "api"
+addrs = ["10.0.0.1:8080"]
+protocol = "http1"
+health_check = { path = "/health", interval = "0s", timeout = "1s" }
+
+[[route]]
+match = { host = "example.com" }
+upstream = "api"
+"#;
+        match parse_logic(toml) {
+            Err(ConfigError::HealthCheckBadDuration { field, .. }) => {
+                assert_eq!(field, "interval");
+            }
+            other => panic!("expected HealthCheckBadDuration, got {other:?}"),
+        }
     }
 }
