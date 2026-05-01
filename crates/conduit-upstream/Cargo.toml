@@ -4,9 +4,24 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Layer 5: connection pool, health checks, circuit breaker, retry policy."
+description = "Layer 5: H1 upstream client with retry. Pool comes from hyper-util's legacy Client (interim); per-worker sharding + breaker + health are P4.x."
 
 [lints]
 workspace = true
 
 [dependencies]
+conduit-proto = { workspace = true }
+conduit-config = { workspace = true }
+
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

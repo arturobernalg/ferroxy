@@ -73,7 +73,7 @@ bytes = "1"
 # hyper is chartered as the H1/H2 building block for early phases;
 # replaced on the hot path in P11.6 only if profiling justifies.
 hyper = { version = "1", features = ["http1", "server", "client"] }
-hyper-util = { version = "0.1", features = ["http1", "server", "client", "tokio"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "client", "client-legacy", "tokio"] }
 httparse = "1"
 # Bridge monoio's IoBuf-based traits to the tokio AsyncRead/AsyncWrite
 # traits hyper expects. Linux-only dep.

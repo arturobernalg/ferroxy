@@ -241,6 +241,19 @@ version = "0.1.0"
 [[package]]
 name = "conduit-upstream"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "conduit-config",
+ "conduit-proto",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "core_affinity"
@@ -458,10 +471,13 @@ checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
  "bytes",
  "futures-channel",
+ "futures-util",
  "http",
  "http-body",
  "hyper",
+ "libc",
  "pin-project-lite",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
