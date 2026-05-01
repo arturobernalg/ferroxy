@@ -29,6 +29,23 @@ fn class_index(status: u16) -> Option<usize> {
 /// Status-class label strings used in Prometheus exposition.
 const CLASS_LABELS: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
 
+/// Map an observation's elapsed seconds to the bucket *it lives in*
+/// (smallest `le` that fits). Returns `LATENCY_BUCKETS_S.len()`
+/// (i.e. one past the end) when the observation is larger than the
+/// largest bucket — the caller treats that as the `+Inf` overflow.
+///
+/// Implementation: linear scan, since the array is short (12) and
+/// the typical request lands in one of the first few buckets. A
+/// binary search costs the same in pipeline cycles at this length.
+fn bucket_index(secs: f64) -> usize {
+    for (i, le) in LATENCY_BUCKETS_S.iter().enumerate() {
+        if secs <= *le {
+            return i;
+        }
+    }
+    LATENCY_BUCKETS_S.len()
+}
+
 /// Prometheus-default histogram bucket boundaries, in seconds. The
 /// last "bucket" is `+Inf`, encoded as a wrapping bump of
 /// `requests_total` (Prometheus's text format requires `+Inf` to be
@@ -99,33 +116,39 @@ impl MetricsHandle {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record the wall-clock duration of a completed request. Bumps
-    /// every cumulative bucket whose `le` is `>=` the observed
-    /// duration in *both* the global histogram and the per-class
-    /// histogram for the response status. Statuses outside 2xx-5xx
-    /// (e.g. 1xx informationals) are recorded only in the global
-    /// histogram.
+    /// Record the wall-clock duration of a completed request.
+    ///
+    /// Storage is **non-cumulative**: each observation bumps exactly
+    /// one bucket (the smallest `le` that fits, or the `+Inf` overflow
+    /// if it's larger than every bucket). Cumulative counts are
+    /// reconstructed in [`Self::render`] by running-sum across the
+    /// buckets. This keeps the per-request atomic op count flat at
+    /// 1 (global) + 1 (per-class) regardless of bucket array length.
+    ///
+    /// Compared to the previous "bump every bucket whose `le >=`
+    /// observed" approach: 1-2 atomic adds per request instead of
+    /// up to 2 × (buckets + 1) = 26.
     pub fn observe_request_duration(&self, elapsed: Duration, status: u16) {
         let secs = elapsed.as_secs_f64();
         let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let bucket = bucket_index(secs);
 
-        // Global histogram (every observation).
-        for (i, le) in LATENCY_BUCKETS_S.iter().enumerate() {
-            if secs <= *le {
-                self.request_duration_buckets[i].fetch_add(1, Ordering::Relaxed);
-            }
+        // Global histogram. `bucket == LATENCY_BUCKETS_S.len()` means
+        // the observation went past the largest bucket; +Inf is
+        // derived at render time from `requests_total` so we just
+        // skip the bucket bump in that case.
+        if bucket < LATENCY_BUCKETS_S.len() {
+            self.request_duration_buckets[bucket].fetch_add(1, Ordering::Relaxed);
         }
         self.request_duration_us_sum
             .fetch_add(us, Ordering::Relaxed);
 
         // Per-class histogram. 1xx and unknown classes (≥ 600) skip
-        // this; they're already counted in the global one.
+        // this; they're still counted in the global one.
         if let Some(idx) = class_index(status) {
             let h = &self.request_duration_by_class[idx];
-            for (i, le) in LATENCY_BUCKETS_S.iter().enumerate() {
-                if secs <= *le {
-                    h.buckets[i].fetch_add(1, Ordering::Relaxed);
-                }
+            if bucket < LATENCY_BUCKETS_S.len() {
+                h.buckets[bucket].fetch_add(1, Ordering::Relaxed);
             }
             h.sum_us.fetch_add(us, Ordering::Relaxed);
         }
@@ -196,15 +219,20 @@ impl MetricsHandle {
             load(&self.responses_4xx),
             load(&self.responses_5xx),
         );
+        // Storage is non-cumulative — one bucket bumped per
+        // observation. The exposition format requires cumulative
+        // counts, so we run the sum at scrape time. With 12 buckets
+        // the work is negligible compared to the format! cost.
         out.push_str(
             "# HELP conduit_request_duration_seconds Wall-clock latency of proxied requests.\n\
              # TYPE conduit_request_duration_seconds histogram\n",
         );
+        let mut cumulative = 0u64;
         for (i, le) in LATENCY_BUCKETS_S.iter().enumerate() {
-            let count = load(&self.request_duration_buckets[i]);
+            cumulative = cumulative.saturating_add(load(&self.request_duration_buckets[i]));
             let _ = writeln!(
                 out,
-                "conduit_request_duration_seconds_bucket{{le=\"{le}\"}} {count}",
+                "conduit_request_duration_seconds_bucket{{le=\"{le}\"}} {cumulative}",
             );
         }
         let total = load(&self.requests_total);
@@ -225,41 +253,38 @@ impl MetricsHandle {
         // with a `class` label so dashboards can query
         //   histogram_quantile(0.99, sum by (le) (rate(...{class="2xx"})))
         // for "p99 of successful responses" without summing across
-        // classes by hand.
+        // classes by hand. Same non-cumulative-to-cumulative trick.
         out.push_str(
             "# HELP conduit_request_duration_seconds_by_class Latency split by status class.\n\
              # TYPE conduit_request_duration_seconds_by_class histogram\n",
         );
         for (idx, class) in CLASS_LABELS.iter().enumerate() {
             let h = &self.request_duration_by_class[idx];
-            let mut class_total = 0u64;
+            let mut class_cumulative = 0u64;
             for (i, le) in LATENCY_BUCKETS_S.iter().enumerate() {
-                let count = load(&h.buckets[i]);
-                if i + 1 == LATENCY_BUCKETS_S.len() {
-                    class_total = count.max(class_total);
-                }
+                class_cumulative = class_cumulative.saturating_add(load(&h.buckets[i]));
                 let _ = writeln!(
                     out,
-                    "conduit_request_duration_seconds_by_class_bucket{{class=\"{class}\",le=\"{le}\"}} {count}",
+                    "conduit_request_duration_seconds_by_class_bucket{{class=\"{class}\",le=\"{le}\"}} {class_cumulative}",
                 );
             }
             // Prometheus's `+Inf` count must equal the total
-            // observation count; we feed that from the per-class
-            // counter rather than back-summing buckets.
+            // observation count for this class; we feed that from the
+            // per-class counter (which is bumped on every observation
+            // regardless of where in the bucket array it landed).
             let class_count = match idx {
                 0 => load(&self.responses_2xx),
                 1 => load(&self.responses_3xx),
                 2 => load(&self.responses_4xx),
                 _ => load(&self.responses_5xx),
             };
-            class_total = class_count.max(class_total);
             let class_micros = load(&h.sum_us);
             #[allow(clippy::cast_precision_loss)]
             let class_seconds = class_micros as f64 / 1_000_000.0;
             let _ = writeln!(
                 out,
-                "conduit_request_duration_seconds_by_class_bucket{{class=\"{class}\",le=\"+Inf\"}} {class_total}\n\
-                 conduit_request_duration_seconds_by_class_count{{class=\"{class}\"}} {class_total}\n\
+                "conduit_request_duration_seconds_by_class_bucket{{class=\"{class}\",le=\"+Inf\"}} {class_count}\n\
+                 conduit_request_duration_seconds_by_class_count{{class=\"{class}\"}} {class_count}\n\
                  conduit_request_duration_seconds_by_class_sum{{class=\"{class}\"}} {class_seconds}",
             );
         }
