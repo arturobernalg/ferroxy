@@ -4,9 +4,24 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Layer 4: routing, filter chain, body piping, timeouts, trailer propagation."
+description = "Layer 4: routing, upstream selection, body piping. Bridges H1/H2/H3 ingress to the upstream pool."
 
 [lints]
 workspace = true
 
 [dependencies]
+conduit-proto = { workspace = true }
+conduit-upstream = { workspace = true }
+conduit-config = { workspace = true }
+
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+hyper = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

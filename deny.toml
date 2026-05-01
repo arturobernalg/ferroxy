@@ -86,13 +86,14 @@ wrappers = [
     "conduit",
 ]
 
-# Layer 6 — config: read by control (orchestration) and by upstream
-# (RetryPolicy::from_config and other per-route knobs in P4+).
+# Layer 6 — config: read by control (orchestration), upstream
+# (RetryPolicy::from_config and other per-route knobs in P4+), and
+# lifecycle (RouteTable / UpstreamMap from_config in P5+).
 # The binary loads the document directly today; once the control
 # layer ships in P10 the binary will go through it instead.
 [[bans.deny]]
 crate = "conduit-config"
-wrappers = ["conduit-control", "conduit-upstream", "conduit"]
+wrappers = ["conduit-control", "conduit-lifecycle", "conduit-upstream", "conduit"]
 
 # Layer 2 — transport: TLS + QUIC. Used by every protocol crate (server
 # side), upstream (egress TLS), control (admin TLS, eventually).

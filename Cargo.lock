@@ -222,6 +222,19 @@ dependencies = [
 [[package]]
 name = "conduit-lifecycle"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "conduit-config",
+ "conduit-proto",
+ "conduit-upstream",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "conduit-proto"
