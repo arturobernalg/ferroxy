@@ -76,13 +76,17 @@ pub enum ForwardError {
     },
 }
 
-/// Upstream holding a shared H1 client + retry policy.
+/// Upstream holding a shared H1 client + retry policy + the list of
+/// backend addresses to dial.
 ///
-/// Cheap to clone — the inner `Client` is `Arc`-backed by hyper-util.
+/// Cheap to clone — the inner `Client` is `Arc`-backed by hyper-util,
+/// and `addrs` is shared via `Arc` so per-request access is a refcount
+/// bump.
 #[derive(Clone)]
 pub struct Upstream {
     client: Client<hyper_util::client::legacy::connect::HttpConnector, BodyOf<Bytes>>,
     retry: RetryPolicy,
+    addrs: std::sync::Arc<[std::net::SocketAddr]>,
 }
 
 /// Type alias for the body type our upstream client uses for requests.
@@ -99,14 +103,29 @@ impl std::fmt::Debug for Upstream {
 }
 
 impl Upstream {
-    /// Build a new upstream with the supplied retry policy. Connection
-    /// pooling parameters use hyper-util's defaults; the
-    /// `[upstream.pool]` config block is honored in a follow-up commit
-    /// once the bridge to per-worker sharding lands (P4.x).
+    /// Build a new upstream with no backend addresses. Forwarding to
+    /// such an upstream falls back to whatever URI the request
+    /// already carries (used by tests that drive the upstream
+    /// directly with a fully-qualified URI).
     pub fn new(retry: RetryPolicy) -> Self {
+        Self::with_addrs(retry, Vec::new())
+    }
+
+    /// Build with the supplied backend addresses. The first address is
+    /// used for every forwarded request until P4.x adds load balancing.
+    pub fn with_addrs(retry: RetryPolicy, addrs: Vec<std::net::SocketAddr>) -> Self {
         let connector = hyper_util::client::legacy::connect::HttpConnector::new();
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        Self { client, retry }
+        Self {
+            client,
+            retry,
+            addrs: addrs.into(),
+        }
+    }
+
+    /// Backend addresses (read-only).
+    pub fn addrs(&self) -> &[std::net::SocketAddr] {
+        &self.addrs
     }
 
     /// Send `req` upstream and return the response. Body is buffered in
@@ -128,7 +147,29 @@ impl Upstream {
         // Buffer the body so retries can replay it. P4 target workload
         // has <1 KB request bodies p95; the buffering cost is
         // negligible.
-        let (parts, body) = req.into_parts();
+        let (mut parts, body) = req.into_parts();
+
+        // Rewrite the URI to an absolute http:// URL pointing at our
+        // first backend address, so hyper-util's client knows where
+        // to dial. P4.x replaces this with the configured load
+        // balancer's pick.
+        if let Some(addr) = self.addrs.first() {
+            let path_and_query = parts
+                .uri
+                .path_and_query()
+                .map_or("/", http::uri::PathAndQuery::as_str)
+                .to_owned();
+            let new_uri: http::Uri = format!("http://{addr}{path_and_query}").parse().map_err(
+                |e: http::uri::InvalidUri| {
+                    ForwardError::Body(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        e.to_string(),
+                    )))
+                },
+            )?;
+            parts.uri = new_uri;
+        }
+
         let bytes = body
             .collect()
             .await

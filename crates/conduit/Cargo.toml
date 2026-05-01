@@ -13,12 +13,29 @@ workspace = true
 name = "conduit"
 path = "src/main.rs"
 
+[features]
+# The binary depends on conduit-io with the runtime-tokio backend
+# enabled. The monoio backend's wire integration into the binary
+# (via a monoio↔tokio bridge so conduit-h1 can drive it) is the next
+# follow-up; until then the binary always runs on tokio. Keeping the
+# selection as a binary feature means switching is a single flag at
+# build time when the bridge ships.
+default = ["runtime-tokio"]
+runtime-tokio = ["conduit-io/runtime-tokio"]
+
 [dependencies]
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 signal-hook = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+bytes = { workspace = true }
 
 conduit-config = { workspace = true }
 conduit-io = { workspace = true }
+conduit-h1 = { workspace = true }
+conduit-lifecycle = { workspace = true }
+conduit-proto = { workspace = true }

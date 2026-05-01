@@ -156,12 +156,12 @@ impl UpstreamMap {
     pub fn from_config(cfg: &conduit_config::Config) -> Self {
         let mut map = Self::new();
         for u in &cfg.upstreams {
-            // P5 ships with a default (no-retry) Upstream per name.
-            // Per-route retry will be wired through Dispatch::handle
-            // when the route's retry block is non-empty (P5.x).
+            // P5 ships with a default (no-retry) Upstream per name and
+            // forwards to the upstream's first listed address — load
+            // balancing across multiple addresses is P5.x.
             map.insert(
                 u.name.clone(),
-                Upstream::new(conduit_upstream::RetryPolicy::default()),
+                Upstream::with_addrs(conduit_upstream::RetryPolicy::default(), u.addrs.clone()),
             );
         }
         map

@@ -159,9 +159,16 @@ name = "conduit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "conduit-config",
+ "conduit-h1",
  "conduit-io",
+ "conduit-lifecycle",
+ "conduit-proto",
+ "http",
+ "http-body-util",
+ "hyper",
  "signal-hook",
  "tracing",
  "tracing-subscriber",

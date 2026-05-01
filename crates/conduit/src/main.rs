@@ -1,26 +1,36 @@
 //! conduit — reverse proxy binary.
 //!
-//! Phase 1: loads + validates configuration, builds a per-worker monoio
-//! `io_uring` runtime via `conduit-io`, and accepts plain-HTTP TCP
-//! connections with a placeholder no-op handler. SIGTERM/SIGINT trigger
-//! graceful shutdown. HTTP parsing arrives in phase 3, TLS in phase 6,
-//! HTTP/3 in phase 9.
+//! Loads + validates configuration, builds the lifecycle dispatch
+//! table, binds HTTP/1.1 listeners via `conduit-io`, and serves real
+//! HTTP traffic by handing each connection to `conduit-h1`'s
+//! `serve_connection` with a service that calls `Dispatch::handle`.
+//!
+//! Runtime backend: tokio (`runtime-tokio` cargo feature, on by
+//! default in this binary). The monoio backend in `conduit-io` is
+//! production-targeted but waits on a monoio↔tokio bridge before the
+//! binary can route real HTTP through it; the bridge is the next
+//! deferred follow-up. TLS (P6), HTTP/2 (P7), and HTTP/3 (P9)
+//! similarly arrive in their own phases.
 
 #![deny(missing_docs)]
 
+use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use clap::Parser;
 use conduit_io::{serve, ServeSpec, ShutdownReport};
+use conduit_lifecycle::Dispatch;
+use conduit_proto::{boxed, Response, StatusCode, VecBody};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
 
 mod log;
 
-// Stable CLI contract. Doc here is internal; user-facing description lives
-// in clap's `about` attribute below.
 #[derive(Debug, Parser)]
 #[command(name = "conduit", version, about = "Reverse proxy")]
 struct Cli {
@@ -90,26 +100,33 @@ fn main() -> ExitCode {
         return ExitCode::from(78);
     }
 
-    if matches!(cfg.server.runtime, conduit_config::RuntimeMode::Tokio) {
-        tracing::error!(
-            "runtime = \"tokio\" requires building conduit with --features runtime-tokio; \
-             that backend ships alongside the monoio default in phase 1.x. \
-             For now, set runtime = \"monoio\".",
-        );
-        return ExitCode::from(78);
-    }
-
     let workers = resolve_workers(cfg.server.workers);
     let mut spec = ServeSpec::new(cfg.server.listen_http.clone(), workers);
     spec.cpu_affinity = cfg.server.cpu_affinity;
 
-    let server = match serve(spec, || {
-        // Phase-1 placeholder handler factory. Each worker calls it once
-        // to get its connection handler. The handler reads nothing,
-        // writes nothing, just drops the stream — there is no protocol
-        // yet. The H1 parser in phase 3 replaces this.
-        |_stream: conduit_io::TcpStream, _peer: std::net::SocketAddr| async move {
-            // Intentionally empty: accept-and-close.
+    // Build the lifecycle dispatcher from the config. Arc-wrapped so
+    // the per-connection handler closures share one read-only copy.
+    let dispatch = Arc::new(Dispatch::from_config(&cfg));
+
+    let dispatch_for_setup = Arc::clone(&dispatch);
+    let server = match serve(spec, move || {
+        let dispatch = Arc::clone(&dispatch_for_setup);
+        // The setup closure runs once per accept loop and produces the
+        // connection-level handler. The handler hands the stream to
+        // conduit-h1's serve_connection with a per-request service
+        // that calls Dispatch::handle.
+        move |stream: conduit_io::TcpStream, peer: std::net::SocketAddr| {
+            let dispatch = Arc::clone(&dispatch);
+            async move {
+                tracing::debug!(?peer, "accepted connection");
+                let handler = move |req: http::Request<Incoming>| {
+                    let dispatch = Arc::clone(&dispatch);
+                    async move { proxy_one(&dispatch, req).await }
+                };
+                if let Err(e) = conduit_h1::serve_connection(stream, handler).await {
+                    tracing::warn!(?peer, error = %e, "connection ended with error");
+                }
+            }
         }
     }) {
         Ok(s) => s,
@@ -136,8 +153,6 @@ fn main() -> ExitCode {
 
     let report: ShutdownReport = server.wait();
 
-    // The signal-handler thread loops on the same flag; once shutdown
-    // started, it has already exited. Joining is best-effort cleanup.
     signal_received.store(true, Ordering::Release);
     let _ = signal_thread.join();
 
@@ -154,6 +169,72 @@ fn main() -> ExitCode {
     }
 }
 
+/// One proxied request: route via `Dispatch`, forward to the named
+/// upstream, return the response. On routing or upstream error,
+/// build a synthetic 502 / 503 response so the client always gets a
+/// well-formed reply.
+async fn proxy_one(
+    dispatch: &Dispatch,
+    req: http::Request<Incoming>,
+) -> Result<Response<conduit_proto::BoxBody>, Infallible> {
+    match dispatch.handle(req).await {
+        Ok(resp) => {
+            let (parts, body) = resp.into_parts();
+            // Erase hyper::body::Incoming → BoxBody so the binary
+            // returns one concrete body type regardless of which
+            // upstream produced the bytes. Cold path; one box per
+            // request — the per-request hot-path no-allocation rule
+            // is met inside conduit-upstream's request loop.
+            let body: conduit_proto::BoxBody = BodyExt::boxed(BodyExt::map_err(body, |e| {
+                let b: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
+                b
+            }));
+            Ok(Response::from_parts(parts, body))
+        }
+        Err(conduit_lifecycle::DispatchError::NoRoute) => {
+            tracing::debug!("no route matched");
+            Ok(error_response(
+                StatusCode::NOT_FOUND,
+                "conduit: no route matched\n",
+            ))
+        }
+        Err(conduit_lifecycle::DispatchError::UpstreamNotRegistered { name }) => {
+            tracing::error!(upstream = %name, "route references unknown upstream");
+            Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "conduit: route references unknown upstream\n",
+            ))
+        }
+        Err(conduit_lifecycle::DispatchError::Upstream(e)) => {
+            tracing::warn!(error = ?e, "upstream forward failed");
+            Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "conduit: upstream unavailable\n",
+            ))
+        }
+        Err(other) => {
+            // `DispatchError` is non_exhaustive so future variants
+            // (e.g. P5.x's filter-rejection) compile here without
+            // editing this match. They get a generic 500.
+            tracing::error!(error = ?other, "dispatch error");
+            Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "conduit: dispatch error\n",
+            ))
+        }
+    }
+}
+
+fn error_response(status: StatusCode, body: &'static str) -> Response<conduit_proto::BoxBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain")
+        .body(boxed(VecBody::from_bytes(Bytes::from_static(
+            body.as_bytes(),
+        ))))
+        .expect("build error response")
+}
+
 fn resolve_workers(w: conduit_config::Workers) -> NonZeroUsize {
     match w {
         conduit_config::Workers::Auto => std::thread::available_parallelism()
@@ -162,9 +243,7 @@ fn resolve_workers(w: conduit_config::Workers) -> NonZeroUsize {
     }
 }
 
-/// Wait for SIGTERM or SIGINT (cooperative cross-thread via signal-hook),
-/// then trigger graceful shutdown. Returns when the first signal arrives
-/// or when the parent flags shutdown via `parent_done`.
+/// Wait for SIGTERM or SIGINT, then trigger graceful shutdown.
 fn install_signal_handler(trigger: &conduit_io::ShutdownTrigger, parent_done: &AtomicBool) {
     use signal_hook::consts::signal::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
@@ -176,9 +255,6 @@ fn install_signal_handler(trigger: &conduit_io::ShutdownTrigger, parent_done: &A
             return;
         }
     };
-    // Iterator blocks until a signal arrives. We only care about the
-    // first one; subsequent signals get the kernel's default
-    // disposition once we exit this thread.
     if let Some(signal) = signals.forever().next() {
         if parent_done.load(Ordering::Acquire) {
             return;
