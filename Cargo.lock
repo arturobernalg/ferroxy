@@ -143,6 +143,72 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "conduit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "conduit-config",
+ "conduit-io",
+ "signal-hook",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "conduit-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "conduit-control"
+version = "0.1.0"
+
+[[package]]
+name = "conduit-h1"
+version = "0.1.0"
+
+[[package]]
+name = "conduit-h2"
+version = "0.1.0"
+
+[[package]]
+name = "conduit-h3"
+version = "0.1.0"
+
+[[package]]
+name = "conduit-io"
+version = "0.1.0"
+dependencies = [
+ "core_affinity",
+ "monoio",
+ "socket2",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "conduit-lifecycle"
+version = "0.1.0"
+
+[[package]]
+name = "conduit-proto"
+version = "0.1.0"
+
+[[package]]
+name = "conduit-transport"
+version = "0.1.0"
+
+[[package]]
+name = "conduit-upstream"
+version = "0.1.0"
+
+[[package]]
 name = "core_affinity"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -168,72 +234,6 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "ferroxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "ferroxy-config",
- "ferroxy-io",
- "signal-hook",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "ferroxy-config"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "ferroxy-control"
-version = "0.1.0"
-
-[[package]]
-name = "ferroxy-h1"
-version = "0.1.0"
-
-[[package]]
-name = "ferroxy-h2"
-version = "0.1.0"
-
-[[package]]
-name = "ferroxy-h3"
-version = "0.1.0"
-
-[[package]]
-name = "ferroxy-io"
-version = "0.1.0"
-dependencies = [
- "core_affinity",
- "monoio",
- "socket2",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "ferroxy-lifecycle"
-version = "0.1.0"
-
-[[package]]
-name = "ferroxy-proto"
-version = "0.1.0"
-
-[[package]]
-name = "ferroxy-transport"
-version = "0.1.0"
-
-[[package]]
-name = "ferroxy-upstream"
-version = "0.1.0"
 
 [[package]]
 name = "fxhash"

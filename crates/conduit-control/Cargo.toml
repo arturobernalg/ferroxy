@@ -1,0 +1,12 @@
+[package]
+name = "conduit-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Layer 6: config hot-reload, admin endpoints, metrics, logging, shutdown coordination."
+
+[lints]
+workspace = true
+
+[dependencies]

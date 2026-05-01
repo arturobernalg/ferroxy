@@ -1,4 +1,4 @@
-# cargo-deny configuration for ferroxy.
+# cargo-deny configuration for conduit.
 #
 # Targets cargo-deny v0.16+ schema (version = 2 where the section supports it).
 # Enforces:
@@ -49,7 +49,7 @@ allow-git = []
 # without breaking the gate; we'll tighten as the dep graph stabilises.
 # `wildcards = "deny"` is non-negotiable: pinned ranges only.
 #
-# Layer model expressed as wrapper allowlists. For each ferroxy-* crate,
+# Layer model expressed as wrapper allowlists. For each conduit-* crate,
 # `wrappers` lists every crate permitted to depend on it directly. Anything
 # else is rejected.
 
@@ -61,76 +61,76 @@ wildcards = "deny"
 # crate (their accept-side glue), upstream (egress sockets), control
 # (admin listener), and the binary.
 [[bans.deny]]
-crate = "ferroxy-io"
+crate = "conduit-io"
 wrappers = [
-    "ferroxy-transport",
-    "ferroxy-h1",
-    "ferroxy-h2",
-    "ferroxy-h3",
-    "ferroxy-upstream",
-    "ferroxy-control",
-    "ferroxy",
+    "conduit-transport",
+    "conduit-h1",
+    "conduit-h2",
+    "conduit-h3",
+    "conduit-upstream",
+    "conduit-control",
+    "conduit",
 ]
 
 # Layer 3 contract — proto: the request/response stream type. Every protocol
 # crate, upstream, lifecycle, control surfaces it; binary wires it.
 [[bans.deny]]
-crate = "ferroxy-proto"
+crate = "conduit-proto"
 wrappers = [
-    "ferroxy-h1",
-    "ferroxy-h2",
-    "ferroxy-h3",
-    "ferroxy-upstream",
-    "ferroxy-lifecycle",
-    "ferroxy-control",
-    "ferroxy",
+    "conduit-h1",
+    "conduit-h2",
+    "conduit-h3",
+    "conduit-upstream",
+    "conduit-lifecycle",
+    "conduit-control",
+    "conduit",
 ]
 
 # Layer 6 — config: only control consumes it (the binary loads it via
 # control or directly during phase 0).
 [[bans.deny]]
-crate = "ferroxy-config"
-wrappers = ["ferroxy-control", "ferroxy"]
+crate = "conduit-config"
+wrappers = ["conduit-control", "conduit"]
 
 # Layer 2 — transport: TLS + QUIC. Used by every protocol crate (server
 # side), upstream (egress TLS), control (admin TLS, eventually).
 [[bans.deny]]
-crate = "ferroxy-transport"
+crate = "conduit-transport"
 wrappers = [
-    "ferroxy-h1",
-    "ferroxy-h2",
-    "ferroxy-h3",
-    "ferroxy-upstream",
-    "ferroxy-control",
-    "ferroxy",
+    "conduit-h1",
+    "conduit-h2",
+    "conduit-h3",
+    "conduit-upstream",
+    "conduit-control",
+    "conduit",
 ]
 
 # Layer 3 — h1: only the upstream pool (client) and the binary use it
 # directly. Server-side wiring goes through transport+lifecycle.
 [[bans.deny]]
-crate = "ferroxy-h1"
-wrappers = ["ferroxy-upstream", "ferroxy"]
+crate = "conduit-h1"
+wrappers = ["conduit-upstream", "conduit"]
 
 [[bans.deny]]
-crate = "ferroxy-h2"
-wrappers = ["ferroxy-upstream", "ferroxy"]
+crate = "conduit-h2"
+wrappers = ["conduit-upstream", "conduit"]
 
 [[bans.deny]]
-crate = "ferroxy-h3"
-wrappers = ["ferroxy-upstream", "ferroxy"]
+crate = "conduit-h3"
+wrappers = ["conduit-upstream", "conduit"]
 
 # Layer 5 — upstream: lifecycle dispatches to it; control reads stats; the
 # binary holds the runtime.
 [[bans.deny]]
-crate = "ferroxy-upstream"
-wrappers = ["ferroxy-lifecycle", "ferroxy-control", "ferroxy"]
+crate = "conduit-upstream"
+wrappers = ["conduit-lifecycle", "conduit-control", "conduit"]
 
 # Layer 4 — lifecycle: control orchestrates it, binary wires it.
 [[bans.deny]]
-crate = "ferroxy-lifecycle"
-wrappers = ["ferroxy-control", "ferroxy"]
+crate = "conduit-lifecycle"
+wrappers = ["conduit-control", "conduit"]
 
 # Layer 6 — control: only the binary depends on it.
 [[bans.deny]]
-crate = "ferroxy-control"
-wrappers = ["ferroxy"]
+crate = "conduit-control"
+wrappers = ["conduit"]
