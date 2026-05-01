@@ -65,13 +65,23 @@ retry = { attempts = 2, on_status = [502, 503, 504], on_connect_error = true }
 | Key             | Type | Notes |
 |-----------------|------|-------|
 | `name`          | string | Referenced from `[[route]]`. |
-| `addrs`         | array of `host:port` | Round-robin'd today. |
+| `addrs`         | array of `host:port` | Round-robin'd; per-addr passive breaker rotates a bad backend out without taking down the pool. |
 | `protocol`      | `"http1"` / `"h2"` | `"h2"` upstream is P7.x scope; `"http1"` is the only working value. |
 | `lb`            | `"round_robin"` / `"p2c"` | Only `"round_robin"` ships today. |
-| `connect_timeout` | duration | Currently unused; per-route timeouts are P5.x scope. |
+| `connect_timeout` | duration | Configures hyper-util's `HttpConnector::set_connect_timeout`. |
 | `pool`          | table | `max_idle_per_host` / `idle_timeout` / `max_lifetime`. |
-| `health_check`  | table | Reserved; active health checks are P5.x scope. |
+| `health_check`  | table | Active probes (see below). Updates the same per-addr breakers the request hot path consults. |
 | `retry`         | table | `attempts`, `on_status` (list of HTTP codes), `on_connect_error` (bool). |
+
+### `[[upstream]] health_check`
+
+| Key                   | Type     | Notes |
+|-----------------------|----------|-------|
+| `path`                | string   | GET path to probe. Defaults to `/healthz`. |
+| `interval`            | duration | Sleep between probes per addr. |
+| `timeout`             | duration | Per-probe deadline; counts as a failure if the response doesn't arrive. |
+| `unhealthy_threshold` | integer  | Consecutive failures that flip the addr's breaker to Open. |
+| `healthy_threshold`   | integer  | Consecutive successes that flip the breaker back to Closed. |
 
 ## `[[route]]`
 
@@ -86,10 +96,26 @@ retry = { attempts = 2, on_status = [502, 503, 504], on_connect_error = true }
 | Key       | Type    | Notes |
 |-----------|---------|-------|
 | `match.host` | glob (e.g. `*.example.com`) | `*` matches any. |
-| `match.path_prefix` | string | Linear-scan match today; a prefix trie is P5.x scope. |
+| `match.path_prefix` | string | Indexed by per-host bucket: O(1) host hash + O(prefixes) longest-prefix scan. |
+| `match.path_exact` | string | O(1) hash lookup; beats prefix in the same bucket. |
+| `match.path_regex` | string | Compiled at config-load. Tried after exact + prefix in declaration order; first match wins. |
 | `upstream` | string  | Must match an `[[upstream]] name`. |
-| `timeouts` | table   | Reserved; per-route timeouts are P5.x scope. |
+| `timeouts.total` | duration | Wall-clock cap on the entire request; `tokio::time::timeout` returns 504 on expiry. |
+| `timeouts.connect` / `read` / `write` | duration | `connect` is wired through to the upstream's `HttpConnector`; `read` / `write` per-leg timeouts still need a hyper-util config rebuild and are next P5.x. |
 | `retry`    | table   | Same shape as upstream-level retry. Per-route retry overrides the upstream's. |
+
+### `[[route]] match.headers`
+
+```toml
+[[route]]
+match = { host = "api.example.com", headers = [{ name = "x-tier", value = "gold" }] }
+upstream = "api-gold"
+```
+
+Header-based matching is parsed but not yet evaluated against
+requests; routes with header predicates fall back to plain host+path
+matching today. Header eval lands when the route bucket grows
+multi-route-per-slot support (P5.x).
 
 ## Hot-reload
 
@@ -98,13 +124,28 @@ with. Supported changes:
 
 - `[[route]]` adds / removes / re-orders / `upstream` rewires
 - `[[upstream]] addrs` set rewrite (the pool itself rebuilds)
-- `[[upstream]] retry` / route-level `retry`
+- `[[upstream]] retry`, `connect_timeout` / route-level `retry`, `timeouts.total`
+- Path matchers: `path_exact` / `path_prefix` / `path_regex` swaps
 
 **Not** hot-reloadable today — restart the process:
 
 - `[server] listen_*`, `admin_listen`
 - `[tls] certs` / `min_version`
 - `[server] workers` / `runtime` / `cpu_affinity`
+- `[upstream] health_check` (probe tasks bind config at startup)
 
 A reload that fails validation logs the error and leaves the previous
 configuration running. The proxy never ends up in a half-loaded state.
+
+## Admin endpoints
+
+The admin server runs on `[server] admin_listen` (default
+`127.0.0.1:9090`). It speaks HTTP/1.1 and exposes:
+
+| Path         | Notes |
+|--------------|-------|
+| `GET /health`     | Liveness — `200 OK` while the process is up. |
+| `GET /ready`      | Readiness — currently always `200 OK` (startup is synchronous). Will track upstream health when active health checks ship in P4.x. |
+| `GET /metrics`    | Prometheus 0.0.4 text exposition: uptime gauge, build_info gauge, request counters by outcome / status class, request-duration histogram (Prometheus default buckets, 1ms..10s). |
+| `GET /upstreams`  | One line per upstream: name, addr list, breaker state (`closed` / `open` / `half_open`). |
+| `GET /`           | Lists endpoints. |
