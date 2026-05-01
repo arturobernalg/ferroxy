@@ -145,6 +145,13 @@ each independently small but stacking up. See
   compiler can inline through the enum dispatch and branch
   prediction sees one variant per response so the cost is ~free.
   One `Box<dyn Body>` heap allocation eliminated per request.
+- **`Upstream::forward`**: skip `body.collect()` when the request
+  body is known empty (`size_hint().exact() == Some(0)`). Most
+  GET / HEAD traffic skips the buffer-then-replay step entirely.
+- **Pre-built `Authority` per addr**: `Upstream` now caches an
+  `Arc<[http::uri::Authority]>` parallel to `addrs`, so per-request
+  URI rewrites just clone (refcount bump on the inner `Bytes`)
+  instead of running `addr.to_string()` + parse on every call.
 
 ### Build / quality / docs
 - Workspace-wide quality gate: `cargo build --workspace --all-targets
