@@ -207,7 +207,13 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     metrics.observe_request_start();
-    match dispatch.handle(req).await {
+    let started = std::time::Instant::now();
+    let result = dispatch.handle(req).await;
+    // Record latency *before* we burn cycles on body conversion or
+    // synthetic-error builders. The histogram represents end-to-end
+    // routing + upstream wall time; per-stage breakdowns are P11.5.
+    metrics.observe_request_duration(started.elapsed());
+    match result {
         Ok(resp) => {
             metrics.observe_status(resp.status().as_u16());
             let (parts, body) = resp.into_parts();
