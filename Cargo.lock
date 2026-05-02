@@ -427,6 +427,7 @@ dependencies = [
 name = "conduit-transport"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "conduit-config",
  "rcgen",
  "rustls",

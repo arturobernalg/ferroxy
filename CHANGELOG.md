@@ -153,6 +153,30 @@ each independently small but stacking up. See
   URI rewrites just clone (refcount bump on the inner `Bytes`)
   instead of running `addr.to_string()` + parse on every call.
 
+### TLS cert hot-reload + upstream HTTP/2 ALPN
+
+`MultiCertResolver` now wraps its `(exact, wildcard, fallback)`
+tables in `arc_swap::ArcSwap`. Calling `reload(specs)` re-reads
+every PEM and atomically swaps the table; the next handshake's
+`ResolvesServerCert::resolve` picks the new entry. Failed reload
+(missing/bad PEM) leaves the previous table active and just logs.
+
+The binary's SIGHUP handler now reloads in this order:
+1. Re-read config from disk.
+2. Build N+1 fresh `Dispatch`es (1 primary + N HTTP-worker), atomic
+   `store` into each swappable.
+3. If HTTPS is configured: `cert_resolver.reload(&cfg.tls.certs)`
+   to swap the cert table.
+
+`load_server_config_with_resolver` is the new entry point for
+callers that want the resolver handle. The convenience
+`load_server_config` is the same minus the handle (back-compat).
+
+Upstream egress connector now advertises `h2,http/1.1` in TLS
+ALPN. h2-capable backends opportunistically negotiate H/2; plain
+and h1-only TLS backends keep getting h1. Wiring h2 actually used
+on the wire (rather than just advertised) is the deferred follow-up.
+
 ### Per-worker `Dispatch` — pool sharding done
 
 Each HTTP plain plane worker now holds its own `Dispatch`,
@@ -248,7 +272,9 @@ in the project's `phaseN_deviations` notes:
 - **Streaming bodies** for the upstream client and H3 ingress (P8.x / P9.x).
 - **Per-leg write timeout** to bound a slow upstream send (P5.x.x.x).
   The read leg ✓ shipped via `TimedBody`.
-- **OCSP stapling**, session-ID cache, certificate hot-reload (P6.x.x).
+- **OCSP stapling**, session-ID cache (P6.x.x). Cert hot-reload
+  ✓ shipped — `MultiCertResolver::reload()` swaps the cert table
+  atomically on SIGHUP without restarting the listener.
 - **0-RTT for QUIC** (P9.x).
 - **`h2spec` / `qlog` CI gates** (P7.x / P9.x).
 - **Upstream H2 / H3 client** — backends still get HTTP/1.1 (P7.x / P9.x).

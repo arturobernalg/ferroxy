@@ -100,7 +100,6 @@ fn main() -> ExitCode {
     let dispatches = build_dispatch_bundle(&cfg, spec.workers.get());
     let dispatch = Arc::clone(&dispatches.primary);
     let worker_dispatches = Arc::clone(&dispatches.http_workers);
-    let (reload_done, reload_thread) = start_reload(&cli.config, &dispatches);
 
     // Single shared metrics sink. Every per-request handler bumps
     // counters on it via `fetch_add(_, Relaxed)`; the admin server
@@ -111,7 +110,15 @@ fn main() -> ExitCode {
     // configured. The HTTPS listener runs on its own tokio runtime
     // thread so its TLS handshake cost does not interfere with the
     // plaintext data-plane runtime under load.
-    let https_thread = spawn_https_thread(&cfg, &dispatch, &metrics);
+    let mut cert_resolver: Option<Arc<conduit_transport::MultiCertResolver>> = None;
+    let https_thread = spawn_https_thread(&cfg, &dispatch, &metrics, &mut cert_resolver);
+
+    // Reload thread can hot-swap both routes/upstreams (every
+    // Dispatch in the bundle) and TLS certs (the resolver picked up
+    // by spawn_https_thread). Routes-only reload still works when
+    // no HTTPS is configured.
+    let (reload_done, reload_thread) =
+        start_reload(&cli.config, &dispatches, cert_resolver.clone());
 
     // Spawn HTTP/3 (QUIC) listener if `[tls]` and `listen_h3` are both
     // configured. Like HTTPS this runs on its own tokio runtime thread.
@@ -419,6 +426,7 @@ fn spawn_https_thread(
     cfg: &conduit_config::Config,
     dispatch: &DispatchSwap,
     metrics: &Arc<conduit_control::MetricsHandle>,
+    cert_resolver: &mut Option<Arc<conduit_transport::MultiCertResolver>>,
 ) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
     if cfg.server.listen_https.is_empty() {
         return None;
@@ -430,13 +438,16 @@ fn spawn_https_thread(
         );
         return None;
     };
-    let server_cfg = match conduit_transport::load_server_config(tls_cfg) {
-        Ok(c) => c,
+    let (server_cfg, resolver) = match conduit_transport::load_server_config_with_resolver(tls_cfg)
+    {
+        Ok(pair) => pair,
         Err(e) => {
             tracing::error!(error = %e, "TLS server config failed; HTTPS disabled");
             return None;
         }
     };
+    // Stash the resolver for SIGHUP-driven hot-reload.
+    *cert_resolver = Some(resolver);
     let acceptor = conduit_transport::build_acceptor(server_cfg);
     let dispatch_clone = Arc::clone(dispatch);
     let metrics_clone = Arc::clone(metrics);
@@ -655,6 +666,7 @@ fn run_https(
 fn start_reload(
     path: &Path,
     bundle: &DispatchBundle,
+    cert_resolver: Option<Arc<conduit_transport::MultiCertResolver>>,
 ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let done = Arc::new(AtomicBool::new(false));
     // Collect every swappable into one Vec so the reload thread
@@ -667,32 +679,46 @@ fn start_reload(
     for d in bundle.http_workers.iter() {
         all.push(Arc::clone(d));
     }
-    let handle = spawn_reload_thread(path.to_path_buf(), Arc::from(all), Arc::clone(&done));
+    let handle = spawn_reload_thread(
+        path.to_path_buf(),
+        Arc::from(all),
+        cert_resolver,
+        Arc::clone(&done),
+    );
     (done, handle)
 }
 
 /// Spawn a thread that listens for SIGHUP and atomically swaps every
 /// live `Dispatch` with a fresh one built from the config file at
-/// `path`. Returns the join handle; `done` flipping true causes the
-/// thread to exit on the next signal (or wake-up).
+/// `path`. If a cert resolver is supplied, certs are also reloaded
+/// from disk. Returns the join handle; `done` flipping true causes
+/// the thread to exit on the next signal (or wake-up).
 fn spawn_reload_thread(
     path: PathBuf,
     dispatches: Arc<[DispatchSwap]>,
+    cert_resolver: Option<Arc<conduit_transport::MultiCertResolver>>,
     done: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("conduit-reload".into())
         .spawn(move || {
-            install_reload_handler(&path, &dispatches, &done);
+            install_reload_handler(&path, &dispatches, cert_resolver.as_deref(), &done);
         })
         .expect("spawn reload thread")
 }
 
 /// Block on SIGHUP, re-read the config, build a new `Dispatch` per
-/// swappable, and atomically `store` each. Errors during reload are
-/// logged and the live dispatchers are left untouched (charter rule:
-/// a bad reload must not break a running proxy).
-fn install_reload_handler(path: &Path, dispatches: &[DispatchSwap], done: &AtomicBool) {
+/// swappable, and atomically `store` each. Cert resolver, if
+/// supplied, gets `reload()` called too — fresh PEM reads, atomic
+/// table swap. Errors during reload are logged and the live
+/// dispatchers + resolver are left untouched (charter rule: a bad
+/// reload must not break a running proxy).
+fn install_reload_handler(
+    path: &Path,
+    dispatches: &[DispatchSwap],
+    cert_resolver: Option<&conduit_transport::MultiCertResolver>,
+    done: &AtomicBool,
+) {
     use signal_hook::consts::signal::SIGHUP;
     use signal_hook::iterator::Signals;
 
@@ -715,6 +741,16 @@ fn install_reload_handler(path: &Path, dispatches: &[DispatchSwap], done: &Atomi
                 // — fresh hyper-util pool, fresh per-addr breakers.
                 for swap in dispatches {
                     swap.store(Arc::new(Dispatch::from_config(&cfg)));
+                }
+                // Hot-reload TLS certs if HTTPS is configured. A bad
+                // PEM file leaves the previous cert table in place
+                // and just logs; HTTPS keeps serving uninterrupted.
+                if let (Some(resolver), Some(tls_cfg)) = (cert_resolver, cfg.tls.as_ref()) {
+                    if let Err(e) = resolver.reload(&tls_cfg.certs) {
+                        tracing::error!(error = %e, "cert hot-reload failed; keeping previous certs");
+                    } else {
+                        tracing::info!(certs = tls_cfg.certs.len(), "TLS cert table reloaded",);
+                    }
                 }
                 tracing::info!(
                     upstreams = cfg.upstreams.len(),

@@ -84,27 +84,52 @@ pub use tokio_rustls::TlsAcceptor;
 /// Returns a `ServerConfig` that requires no client cert and accepts
 /// either TLS 1.2 or 1.3 per the `tls.min_version` config field.
 pub fn load_server_config(cfg: &conduit_config::TlsConfig) -> Result<ServerConfig, TlsError> {
+    let (server_cfg, _) = load_server_config_with_resolver(cfg)?;
+    Ok(server_cfg)
+}
+
+/// Like [`load_server_config`] but also returns the resolver handle.
+/// The caller can hold onto the `Arc<MultiCertResolver>` and call
+/// [`MultiCertResolver::reload`] on SIGHUP to swap certs without
+/// restarting the listener.
+pub fn load_server_config_with_resolver(
+    cfg: &conduit_config::TlsConfig,
+) -> Result<(ServerConfig, Arc<MultiCertResolver>), TlsError> {
     if cfg.certs.is_empty() {
         return Err(TlsError::NoCerts);
     }
-    let resolver = MultiCertResolver::from_config(&cfg.certs)?;
+    let resolver = Arc::new(MultiCertResolver::from_config(&cfg.certs)?);
 
     let mut server_cfg = ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver));
+        .with_cert_resolver(Arc::clone(&resolver) as _);
     // Advertise HTTP/2 first, falling back to HTTP/1.1. RFC 7540 §3.3
     // requires h2 over TLS to be ALPN-negotiated, and most clients
     // pick whichever the server lists first that they support.
     server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(server_cfg)
+    Ok((server_cfg, resolver))
 }
 
 /// SNI-aware cert resolver. Holds an exact-match table for full host
 /// names and a wildcard table for `*.example.com`-style patterns.
 /// Falls back to the first registered cert when SNI is absent or no
 /// pattern matches — matching nginx's default-server behaviour.
+///
+/// The cert table itself is wrapped in [`arc_swap::ArcSwap`] so
+/// SIGHUP can hot-reload certs without restarting the server. The
+/// active rustls `ServerConfig` holds an `Arc<dyn ResolvesServerCert>`
+/// pointing at this struct; subsequent `reload()` calls atomically
+/// swap the inner table, and the next handshake's
+/// [`ResolvesServerCert::resolve`] picks the new entry.
 #[derive(Debug)]
-struct MultiCertResolver {
+pub struct MultiCertResolver {
+    inner: arc_swap::ArcSwap<CertTable>,
+}
+
+/// One snapshot of the cert table. Cheap to construct (cert / key
+/// PEMs are read fresh each time) and cheap to swap.
+#[derive(Debug)]
+struct CertTable {
     /// Lower-cased SNI → `CertifiedKey` for exact-match patterns.
     exact: std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>,
     /// `(suffix, ck)` for wildcard patterns. `suffix` is the part after
@@ -117,54 +142,77 @@ struct MultiCertResolver {
 }
 
 impl MultiCertResolver {
-    fn from_config(specs: &[conduit_config::CertSpec]) -> Result<Self, TlsError> {
-        let mut exact = std::collections::HashMap::with_capacity(specs.len());
-        let mut wildcard = Vec::new();
-        let mut fallback: Option<Arc<rustls::sign::CertifiedKey>> = None;
-        for spec in specs {
-            let certs = load_certs(&spec.cert)?;
-            let key = load_key(&spec.key)?;
-            let signing_key =
-                rustls::crypto::ring::sign::any_supported_type(&key).map_err(|source| {
-                    TlsError::Rustls {
-                        sni: spec.sni.clone(),
-                        source,
-                    }
-                })?;
-            let ck = Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key));
-            if fallback.is_none() {
-                fallback = Some(Arc::clone(&ck));
-            }
-            if let Some(suffix) = spec.sni.strip_prefix("*.") {
-                wildcard.push((suffix.to_ascii_lowercase(), ck));
-            } else {
-                exact.insert(spec.sni.to_ascii_lowercase(), ck);
-            }
-        }
+    /// Build a fresh resolver from the config. Reads + parses every
+    /// cert+key referenced in `specs`.
+    pub fn from_config(specs: &[conduit_config::CertSpec]) -> Result<Self, TlsError> {
+        let table = build_table(specs)?;
         Ok(Self {
-            exact,
-            wildcard,
-            fallback: fallback.expect("specs non-empty was checked by the caller"),
+            inner: arc_swap::ArcSwap::new(Arc::new(table)),
         })
     }
 
+    /// Atomically swap the cert table. Reads every cert+key from
+    /// disk; on failure the previous table is left active and the
+    /// error is surfaced (charter rule: a bad reload must not break
+    /// a running proxy).
+    pub fn reload(&self, specs: &[conduit_config::CertSpec]) -> Result<(), TlsError> {
+        let table = build_table(specs)?;
+        self.inner.store(Arc::new(table));
+        Ok(())
+    }
+
     fn lookup(&self, sni: &str) -> Arc<rustls::sign::CertifiedKey> {
+        let table = self.inner.load();
         let key = sni.to_ascii_lowercase();
-        if let Some(ck) = self.exact.get(&key) {
+        if let Some(ck) = table.exact.get(&key) {
             return Arc::clone(ck);
         }
         // `*.foo.com` matches `bar.foo.com` (one label below). Reject
         // matches with multiple labels (no `*.foo.com` for `x.y.foo.com`).
         if let Some(dot_idx) = key.find('.') {
             let suffix = &key[dot_idx + 1..];
-            for (pat, ck) in &self.wildcard {
+            for (pat, ck) in &table.wildcard {
                 if pat == suffix {
                     return Arc::clone(ck);
                 }
             }
         }
-        Arc::clone(&self.fallback)
+        Arc::clone(&table.fallback)
     }
+}
+
+fn build_table(specs: &[conduit_config::CertSpec]) -> Result<CertTable, TlsError> {
+    if specs.is_empty() {
+        return Err(TlsError::NoCerts);
+    }
+    let mut exact = std::collections::HashMap::with_capacity(specs.len());
+    let mut wildcard = Vec::new();
+    let mut fallback: Option<Arc<rustls::sign::CertifiedKey>> = None;
+    for spec in specs {
+        let certs = load_certs(&spec.cert)?;
+        let key = load_key(&spec.key)?;
+        let signing_key =
+            rustls::crypto::ring::sign::any_supported_type(&key).map_err(|source| {
+                TlsError::Rustls {
+                    sni: spec.sni.clone(),
+                    source,
+                }
+            })?;
+        let ck = Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key));
+        if fallback.is_none() {
+            fallback = Some(Arc::clone(&ck));
+        }
+        if let Some(suffix) = spec.sni.strip_prefix("*.") {
+            wildcard.push((suffix.to_ascii_lowercase(), ck));
+        } else {
+            exact.insert(spec.sni.to_ascii_lowercase(), ck);
+        }
+    }
+    Ok(CertTable {
+        exact,
+        wildcard,
+        fallback: fallback.expect("specs non-empty was checked above"),
+    })
 }
 
 impl rustls::server::ResolvesServerCert for MultiCertResolver {
@@ -173,11 +221,12 @@ impl rustls::server::ResolvesServerCert for MultiCertResolver {
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let sni = client_hello.server_name().unwrap_or("");
-        Some(if sni.is_empty() {
-            Arc::clone(&self.fallback)
+        if sni.is_empty() {
+            // No SNI → fall back to the first cert.
+            Some(Arc::clone(&self.inner.load().fallback))
         } else {
-            self.lookup(sni)
-        })
+            Some(self.lookup(sni))
+        }
     }
 }
 
@@ -259,9 +308,11 @@ mod tests {
             }
         }
         MultiCertResolver {
-            exact,
-            wildcard,
-            fallback,
+            inner: arc_swap::ArcSwap::new(Arc::new(CertTable {
+                exact,
+                wildcard,
+                fallback,
+            })),
         }
     }
 
