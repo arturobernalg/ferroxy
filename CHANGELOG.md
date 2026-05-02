@@ -153,6 +153,29 @@ each independently small but stacking up. See
   URI rewrites just clone (refcount bump on the inner `Bytes`)
   instead of running `addr.to_string()` + parse on every call.
 
+### Per-worker `Dispatch` — pool sharding done
+
+Each HTTP plain plane worker now holds its own `Dispatch`,
+`UpstreamMap`, and `Upstream::client`. The hyper-util
+`Mutex<Pool>` is no longer shared across worker threads; cross-
+worker contention on connection acquisition is gone for the
+highest-RPS path.
+
+Implementation:
+- `DispatchBundle` holds one `primary` swappable + N
+  `http_workers` swappables.
+- HTTPS / H3 / admin / health / reload threads use the primary
+  (each is on its own dedicated thread anyway).
+- `start_http_server`'s `setup` closure pulls the next
+  `http_worker` via a `fetch_add` counter, so each worker thread
+  gets one slot.
+- SIGHUP reload updates **every** swappable (1 + N) atomically —
+  both the shared dispatch and the per-worker dispatches see
+  the new config. Failed reload leaves them all untouched.
+
+Smoke-tested with workers=4 × 30 concurrent requests; all served,
+metrics agree, `/upstreams` renders the live state.
+
 ### Per-worker tokio backend
 
 `conduit-io::tokio_worker` was a single multi-thread runtime
@@ -232,14 +255,6 @@ in the project's `phaseN_deviations` notes:
 - **monoio↔tokio bridge** so the binary can drive monoio's io_uring
   backend through hyper (P3.x).
 - **bumpalo per-request arena** for header storage (P3.x).
-- **Per-worker connection-pool sharding inside `Upstream`**: the
-  tokio worker model is now per-worker (each worker a current-thread
-  runtime; SO_REUSEPORT across N binders); the next step is making
-  `Upstream::client` per-worker so each shard owns its own pool.
-  Today the Client is still globally shared via `Arc`, so workers
-  contend on its internal `Mutex<Pool>`. Plumbing in
-  `Dispatch::from_config` for per-worker `Upstream` lands when this
-  ships.
 - **OpenTelemetry tracing** with W3C `traceparent` propagation
   (P10.x.x).
 - **Real benchmark numbers vs nginx / Pingora** — gated on a real
