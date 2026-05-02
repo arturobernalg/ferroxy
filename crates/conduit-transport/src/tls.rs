@@ -107,6 +107,20 @@ pub fn load_server_config_with_resolver(
     // requires h2 over TLS to be ALPN-negotiated, and most clients
     // pick whichever the server lists first that they support.
     server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // QUIC 0-RTT: rustls' `max_early_data_size` gates TLS 1.3
+    // early data. Quinn's `QuicServerConfig::try_from` picks this
+    // up automatically. Default is 0 (disabled). Charter rule:
+    // 0-RTT is off unless the operator opts in via [tls]
+    // enable_0rtt = true; the request is replayable on the wire so
+    // applications must keep their handlers idempotent.
+    if cfg.enable_0rtt {
+        // 16 KiB matches the rustls / quinn defaults when 0-RTT is
+        // explicitly enabled.
+        server_cfg.max_early_data_size = 16 * 1024;
+        tracing::warn!(
+            "QUIC 0-RTT early data enabled — replayable; ensure handlers are idempotent"
+        );
+    }
     // TLS 1.2 session-ticket resumption: 12-hour rotating
     // ChaCha20Poly1305 ticketer (rustls' recommended configuration).
     // rustls' default ticketer is `NeverProducesTickets`, so without

@@ -153,6 +153,18 @@ each independently small but stacking up. See
   URI rewrites just clone (refcount bump on the inner `Bytes`)
   instead of running `addr.to_string()` + parse on every call.
 
+### QUIC 0-RTT (opt-in)
+
+`[tls] enable_0rtt = true` sets rustls' `max_early_data_size` to
+16 KiB on the server config. Quinn's
+`QuicServerConfig::try_from(rustls_cfg)` picks it up; the H3
+listener accepts TLS 1.3 early data on resumed sessions.
+
+Charter rule: 0-RTT is **off by default** because early data is
+replayable by an on-path attacker. Enabling it surfaces a startup
+warning so operators have to acknowledge that handlers must be
+idempotent.
+
 ### TLS extras: session tickets + OCSP stapling
 
 - **Session ticket resumption (TLS 1.2)**: rustls' default ticketer
@@ -293,7 +305,6 @@ in the project's `phaseN_deviations` notes:
   `[[tls.certs]] ocsp_response` path attaches a pre-fetched DER
   response to the `CertifiedKey`; refreshed by SIGHUP. Cert
   hot-reload ✓ shipped earlier in this section.
-- **0-RTT for QUIC** (P9.x).
 - **`h2spec` / `qlog` CI gates** (P7.x / P9.x).
 - **Upstream H2 / H3 client** — backends still get HTTP/1.1 (P7.x / P9.x).
 - **monoio↔tokio bridge** so the binary can drive monoio's io_uring

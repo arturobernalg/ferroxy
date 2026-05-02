@@ -124,6 +124,13 @@ pub struct TlsConfig {
     /// Staple OCSP responses. Default: true.
     #[serde(default = "true_")]
     pub ocsp_stapling: bool,
+
+    /// Allow QUIC 0-RTT early data on the H3 listener. Default:
+    /// false. **Security note**: 0-RTT data is replayable by a
+    /// network attacker and must only be used for idempotent
+    /// requests. Charter rule: off unless the operator opts in.
+    #[serde(default)]
+    pub enable_0rtt: bool,
 }
 
 /// Minimum negotiated TLS version.
