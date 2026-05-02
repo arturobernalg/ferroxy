@@ -207,12 +207,18 @@ pub(crate) fn build_https_connector(
     http: hyper_util::client::legacy::connect::HttpConnector,
     tls: Option<UpstreamTlsOptions>,
 ) -> Result<Connector, TlsLoadError> {
+    // `enable_http1().enable_http2()` advertises both protocols in
+    // TLS ALPN; the backend picks. Plain-HTTP backends always go
+    // h1. HTTPS backends that advertise `h2` in their server hello
+    // get H/2 to the upstream — fewer connections, multiplexed
+    // streams, less head-of-line blocking on the egress side.
     let Some(opts) = tls else {
         // Default path: webpki root store, standard verifier.
         return Ok(hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
             .enable_http1()
+            .enable_http2()
             .wrap_connector(http));
     };
     let client_cfg = build_client_config(&opts)?;
@@ -220,6 +226,7 @@ pub(crate) fn build_https_connector(
         .with_tls_config(client_cfg)
         .https_or_http()
         .enable_http1()
+        .enable_http2()
         .wrap_connector(http))
 }
 
