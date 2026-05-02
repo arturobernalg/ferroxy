@@ -293,25 +293,47 @@ forever-pending body returns `ReadTimeout`) and `ends_cleanly_on_eos`
 
 ### Deferred (charter-tracked)
 
-These items are charter scope but not yet shipped. Each is tracked
-in the project's `phaseN_deviations` notes:
+These items are charter scope but not yet shipped. Each is
+either substantial multi-day work or genuinely
+infrastructure-gated. Tracked in the per-phase deviation notes.
 
-- **Streaming bodies** for the upstream client and H3 ingress (P8.x / P9.x).
-- **Per-leg write timeout** to bound a slow upstream send (P5.x.x.x).
-  The read leg ✓ shipped via `TimedBody`.
-- **Session-ID cache** (P6.x.x). TLS 1.2 session-ticket resumption
-  ✓ shipped (12-hour rotating ChaCha20Poly1305 ticketer per
-  rustls' recommended config). OCSP stapling ✓ shipped — optional
-  `[[tls.certs]] ocsp_response` path attaches a pre-fetched DER
-  response to the `CertifiedKey`; refreshed by SIGHUP. Cert
-  hot-reload ✓ shipped earlier in this section.
-- **`h2spec` / `qlog` CI gates** (P7.x / P9.x).
-- **Upstream H2 / H3 client** — backends still get HTTP/1.1 (P7.x / P9.x).
-- **monoio↔tokio bridge** so the binary can drive monoio's io_uring
-  backend through hyper (P3.x).
-- **bumpalo per-request arena** for header storage (P3.x).
+**Substantial code work:**
+
+- **Streaming request and response bodies** — today the upstream
+  request body is buffered into `Bytes` so retry replay works,
+  and the H3 ingress drains the request stream before invoking
+  the handler. A streaming path requires a different retry model
+  (replay buffer with a size cap, or no-replay-after-bytes-sent)
+  and a streaming Body impl over h3's `recv_data` (P8.x / P9.x).
+- **Upstream H2 / H3 actually on the wire** — the egress
+  connector advertises `h2,http/1.1` in TLS ALPN, and the schema's
+  `protocol = "h2"` is parsed; the version-forcing in
+  `Upstream::forward` still pins requests to HTTP/1.1. Wiring real
+  H2 egress needs a per-upstream connector + version split (P7.x).
+- **Per-leg write timeout** — the wire-write happens inside
+  hyper-util's connector, with no clean external wrap point. The
+  per-route `total` timeout already bounds a slow upstream send
+  in practice; a true per-leg write timeout would require forking
+  the connector or contributing it upstream (P5.x.x.x).
+- **monoio↔tokio bridge** — the binary needs `monoio_compat` to
+  expose `monoio::net::TcpStream` as a tokio `AsyncRead +
+  AsyncWrite` so hyper can drive it. The dep is in the workspace;
+  the bridge wiring is the missing piece. Real win on Linux
+  io_uring under load (P3.x).
+- **bumpalo per-request arena** for header storage — needs hyper
+  internals access; a shippable path runs alongside the P11.6
+  hyper-replacement gate, both conditional on a real profile (P3.x).
+
+**Infrastructure-gated:**
+
+- **`h2spec` / `qlog` CI gates** (P7.x / P9.x). Need the binary
+  running in CI with a known good baseline; tracked alongside the
+  bench-box plan.
 - **OpenTelemetry tracing** with W3C `traceparent` propagation
-  (P10.x.x).
+  (P10.x.x). The `traceparent` and `tracestate` headers already
+  pass through unchanged; emitting OTLP spans linked to the
+  inbound trace needs an `opentelemetry` exporter dep tree and a
+  collector deployment to be useful.
 - **Real benchmark numbers vs nginx / Pingora** — gated on a real
   bench box per [`BENCHMARKS.md`](./BENCHMARKS.md). Honest current
   status: architecturally plausible, empirically unproven.
