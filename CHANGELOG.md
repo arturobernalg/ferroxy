@@ -153,6 +153,21 @@ each independently small but stacking up. See
   URI rewrites just clone (refcount bump on the inner `Bytes`)
   instead of running `addr.to_string()` + parse on every call.
 
+### TLS extras: session tickets + OCSP stapling
+
+- **Session ticket resumption (TLS 1.2)**: rustls' default ticketer
+  is `NeverProducesTickets`, so without a config every TLS 1.2
+  client paid the full handshake cost on every connection.
+  `load_server_config` now installs `rustls::crypto::ring::Ticketer::new()`
+  — a 12-hour rotating ChaCha20Poly1305 ticketer (rustls' recommended
+  configuration). TLS 1.3 has its own resumption (PSK) and
+  needs no opt-in here.
+- **OCSP stapling**: `[[tls.certs]] ocsp_response` accepts an
+  optional path to a pre-fetched DER OCSP response. Loaded into
+  the `CertifiedKey` and stapled into handshakes by rustls.
+  Operators refresh the file out-of-band (e.g. certbot's
+  `--deploy-hook`) and SIGHUP picks it up.
+
 ### TLS cert hot-reload + upstream HTTP/2 ALPN
 
 `MultiCertResolver` now wraps its `(exact, wildcard, fallback)`
@@ -272,9 +287,12 @@ in the project's `phaseN_deviations` notes:
 - **Streaming bodies** for the upstream client and H3 ingress (P8.x / P9.x).
 - **Per-leg write timeout** to bound a slow upstream send (P5.x.x.x).
   The read leg ✓ shipped via `TimedBody`.
-- **OCSP stapling**, session-ID cache (P6.x.x). Cert hot-reload
-  ✓ shipped — `MultiCertResolver::reload()` swaps the cert table
-  atomically on SIGHUP without restarting the listener.
+- **Session-ID cache** (P6.x.x). TLS 1.2 session-ticket resumption
+  ✓ shipped (12-hour rotating ChaCha20Poly1305 ticketer per
+  rustls' recommended config). OCSP stapling ✓ shipped — optional
+  `[[tls.certs]] ocsp_response` path attaches a pre-fetched DER
+  response to the `CertifiedKey`; refreshed by SIGHUP. Cert
+  hot-reload ✓ shipped earlier in this section.
 - **0-RTT for QUIC** (P9.x).
 - **`h2spec` / `qlog` CI gates** (P7.x / P9.x).
 - **Upstream H2 / H3 client** — backends still get HTTP/1.1 (P7.x / P9.x).

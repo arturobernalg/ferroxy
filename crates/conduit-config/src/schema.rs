@@ -148,6 +148,13 @@ pub struct CertSpec {
     pub cert: PathBuf,
     /// PEM-encoded private key.
     pub key: PathBuf,
+    /// Optional pre-fetched OCSP response (DER) attached to the
+    /// `CertifiedKey`. Cert hot-reload picks the new file up too.
+    /// Operators are expected to refresh this file out-of-band
+    /// (typically via certbot's `--deploy-hook` running
+    /// `openssl ocsp ... > $path` and then `kill -HUP $pid`).
+    #[serde(default)]
+    pub ocsp_response: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------

@@ -107,6 +107,20 @@ pub fn load_server_config_with_resolver(
     // requires h2 over TLS to be ALPN-negotiated, and most clients
     // pick whichever the server lists first that they support.
     server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // TLS 1.2 session-ticket resumption: 12-hour rotating
+    // ChaCha20Poly1305 ticketer (rustls' recommended configuration).
+    // rustls' default ticketer is `NeverProducesTickets`, so without
+    // this every TLS 1.2 client pays the full handshake cost on
+    // every connection. TLS 1.3 has its own resumption (PSK) which
+    // hyper-rustls / browsers handle independently.
+    match rustls::crypto::ring::Ticketer::new() {
+        Ok(t) => server_cfg.ticketer = t,
+        Err(e) => {
+            // Non-fatal: server still works without resumption,
+            // just slower. Log + continue.
+            tracing::warn!(error = %e, "failed to build TLS session ticketer; resumption disabled");
+        }
+    }
     Ok((server_cfg, resolver))
 }
 
@@ -198,7 +212,18 @@ fn build_table(specs: &[conduit_config::CertSpec]) -> Result<CertTable, TlsError
                     source,
                 }
             })?;
-        let ck = Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key));
+        let mut ck = rustls::sign::CertifiedKey::new(certs, signing_key);
+        // Optional pre-fetched OCSP response (DER bytes) → stapled
+        // by rustls into the TLS handshake. The operator refreshes
+        // the file out-of-band; reload() picks up the new contents.
+        if let Some(path) = spec.ocsp_response.as_ref() {
+            let bytes = std::fs::read(path).map_err(|source| TlsError::ReadFile {
+                path: path.clone(),
+                source,
+            })?;
+            ck.ocsp = Some(bytes);
+        }
+        let ck = Arc::new(ck);
         if fallback.is_none() {
             fallback = Some(Arc::clone(&ck));
         }
