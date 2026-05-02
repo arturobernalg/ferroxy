@@ -97,9 +97,10 @@ fn main() -> ExitCode {
     }
 
     let spec = build_serve_spec(&cfg);
-    let dispatch = build_dispatch_swap(&cfg);
-
-    let (reload_done, reload_thread) = start_reload(&cli.config, &dispatch);
+    let dispatches = build_dispatch_bundle(&cfg, spec.workers.get());
+    let dispatch = Arc::clone(&dispatches.primary);
+    let worker_dispatches = Arc::clone(&dispatches.http_workers);
+    let (reload_done, reload_thread) = start_reload(&cli.config, &dispatches);
 
     // Single shared metrics sink. Every per-request handler bumps
     // counters on it via `fetch_add(_, Relaxed)`; the admin server
@@ -133,7 +134,7 @@ fn main() -> ExitCode {
     let server = if cfg.server.listen_http.is_empty() {
         None
     } else {
-        match start_http_server(spec, Arc::clone(&dispatch), Arc::clone(&metrics)) {
+        match start_http_server(spec, Arc::clone(&worker_dispatches), Arc::clone(&metrics)) {
             Ok(s) => Some(s),
             Err(e) => {
                 tracing::error!(error = %e, "bind failed");
@@ -163,13 +164,7 @@ fn main() -> ExitCode {
         }
     };
 
-    reload_done.store(true, Ordering::Release);
-    let _ = reload_thread.join();
-
-    health_cancel.store(true, Ordering::Release);
-    if let Some(h) = health_thread {
-        let _ = h.join();
-    }
+    join_background(&reload_done, reload_thread, &health_cancel, health_thread);
 
     join_aux_threads(
         &admin_cancel,
@@ -373,13 +368,28 @@ impl http_body::Body for ProxyBody {
 /// Bind the plaintext-HTTP listeners and start the conduit-io serve
 /// loop. Each accepted TCP stream is handed to `conduit-h1::serve_connection`
 /// with a per-request service that calls `Dispatch::handle`.
+///
+/// Per-worker pool sharding: `worker_dispatches` holds N independent
+/// `Dispatch`es (one per worker — built from the same `Config` so
+/// they're functionally identical, but each holds its own
+/// `Upstream::client` and per-addr breakers). The `setup` closure
+/// is called once per worker per listener; a `fetch_add` counter
+/// dispenses dispatches in order so each worker gets its own pool
+/// shard. SIGHUP reloads update every entry in the vec.
 fn start_http_server(
     spec: ServeSpec,
-    dispatch: DispatchSwap,
+    worker_dispatches: Arc<[DispatchSwap]>,
     metrics: Arc<conduit_control::MetricsHandle>,
 ) -> Result<conduit_io::Server, conduit_io::BindError> {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n = worker_dispatches.len();
     let server = serve(spec, move || {
-        let dispatch = Arc::clone(&dispatch);
+        // Pick this worker's Dispatch slot. `% n` keeps us in
+        // bounds if `setup` is called more than N times (multi-
+        // listener configs); single-listener configs see exactly
+        // one call per worker.
+        let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
+        let dispatch = Arc::clone(&worker_dispatches[idx]);
         let metrics = Arc::clone(&metrics);
         move |stream: conduit_io::TcpStream, peer: std::net::SocketAddr| {
             let dispatch = Arc::clone(&dispatch);
@@ -644,35 +654,45 @@ fn run_https(
 /// requests keep their old snapshot.
 fn start_reload(
     path: &Path,
-    dispatch: &DispatchSwap,
+    bundle: &DispatchBundle,
 ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let done = Arc::new(AtomicBool::new(false));
-    let handle = spawn_reload_thread(path.to_path_buf(), Arc::clone(dispatch), Arc::clone(&done));
+    // Collect every swappable into one Vec so the reload thread
+    // updates them all atomically (each store is independent; the
+    // worst case during reload is a window where some workers see
+    // the new config and others see the old, which is fine —
+    // requests using the old keep their old snapshot to completion).
+    let mut all: Vec<DispatchSwap> = Vec::with_capacity(1 + bundle.http_workers.len());
+    all.push(Arc::clone(&bundle.primary));
+    for d in bundle.http_workers.iter() {
+        all.push(Arc::clone(d));
+    }
+    let handle = spawn_reload_thread(path.to_path_buf(), Arc::from(all), Arc::clone(&done));
     (done, handle)
 }
 
-/// Spawn a thread that listens for SIGHUP and atomically swaps the
-/// live `Dispatch` with one rebuilt from the config file at `path`.
-/// Returns the join handle; `done` flipping true causes the thread to
-/// exit on the next signal (or wake-up).
+/// Spawn a thread that listens for SIGHUP and atomically swaps every
+/// live `Dispatch` with a fresh one built from the config file at
+/// `path`. Returns the join handle; `done` flipping true causes the
+/// thread to exit on the next signal (or wake-up).
 fn spawn_reload_thread(
     path: PathBuf,
-    dispatch: DispatchSwap,
+    dispatches: Arc<[DispatchSwap]>,
     done: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("conduit-reload".into())
         .spawn(move || {
-            install_reload_handler(&path, &dispatch, &done);
+            install_reload_handler(&path, &dispatches, &done);
         })
         .expect("spawn reload thread")
 }
 
-/// Block on SIGHUP, re-read the config, build a new `Dispatch`, and
-/// atomically swap it in via `ArcSwap::store`. Errors during reload
-/// are logged and the live dispatcher is left untouched (charter
-/// rule: a bad reload must not break a running proxy).
-fn install_reload_handler(path: &Path, dispatch: &DispatchSwap, done: &AtomicBool) {
+/// Block on SIGHUP, re-read the config, build a new `Dispatch` per
+/// swappable, and atomically `store` each. Errors during reload are
+/// logged and the live dispatchers are left untouched (charter rule:
+/// a bad reload must not break a running proxy).
+fn install_reload_handler(path: &Path, dispatches: &[DispatchSwap], done: &AtomicBool) {
     use signal_hook::consts::signal::SIGHUP;
     use signal_hook::iterator::Signals;
 
@@ -690,12 +710,17 @@ fn install_reload_handler(path: &Path, dispatch: &DispatchSwap, done: &AtomicBoo
         tracing::info!(path = %path.display(), "received SIGHUP; reloading config");
         match conduit_config::load(path) {
             Ok(cfg) => {
-                let new_dispatch = Arc::new(Dispatch::from_config(&cfg));
-                dispatch.store(new_dispatch);
+                // Build one fresh Dispatch *per swappable*. Each
+                // worker gets its own per-worker `Upstream::client`
+                // — fresh hyper-util pool, fresh per-addr breakers.
+                for swap in dispatches {
+                    swap.store(Arc::new(Dispatch::from_config(&cfg)));
+                }
                 tracing::info!(
                     upstreams = cfg.upstreams.len(),
                     routes = cfg.routes.len(),
-                    "reload succeeded; new dispatch active",
+                    swappables = dispatches.len(),
+                    "reload succeeded; new dispatches active",
                 );
             }
             Err(e) => {
@@ -734,6 +759,24 @@ fn spawn_signal_thread(
         })
         .expect("spawn signal handler thread");
     (signal_received, handle)
+}
+
+/// Stop and join the long-lived background threads (reload + health
+/// probes) that aren't tied to the data-plane runtime. Called once
+/// the data plane has reported shutdown but before the aux threads
+/// are joined.
+fn join_background(
+    reload_done: &Arc<AtomicBool>,
+    reload_thread: std::thread::JoinHandle<()>,
+    health_cancel: &Arc<AtomicBool>,
+    health_thread: Option<std::thread::JoinHandle<()>>,
+) {
+    reload_done.store(true, Ordering::Release);
+    let _ = reload_thread.join();
+    health_cancel.store(true, Ordering::Release);
+    if let Some(h) = health_thread {
+        let _ = h.join();
+    }
 }
 
 /// Stop and join the admin / https / h3 / signal-handler threads
@@ -920,6 +963,35 @@ fn build_serve_spec(cfg: &conduit_config::Config) -> ServeSpec {
 /// lock on the hot path. Each request loads a snapshot `Arc` once.
 fn build_dispatch_swap(cfg: &conduit_config::Config) -> DispatchSwap {
     Arc::new(ArcSwap::new(Arc::new(Dispatch::from_config(cfg))))
+}
+
+/// Bundle of `Dispatch`es shared across the binary's planes. The
+/// primary is used by HTTPS / H3 / admin / reload / health (each on
+/// their own dedicated thread); the HTTP plain plane gets N
+/// per-worker dispatches so each worker thread has its own
+/// `Upstream::client` (and therefore its own `hyper-util`
+/// `Mutex<Pool>` instance, eliminating cross-worker pool contention).
+///
+/// Each dispatch is functionally identical (built from the same
+/// `Config`) but holds its own per-upstream state: the pool, the
+/// per-addr breakers, and the round-robin counter.
+struct DispatchBundle {
+    /// Used by every non-HTTP plane. One swappable.
+    primary: DispatchSwap,
+    /// One swappable per HTTP plain plane worker. The serve loop
+    /// hands each worker its own slot via a `fetch_add` counter.
+    http_workers: Arc<[DispatchSwap]>,
+}
+
+fn build_dispatch_bundle(cfg: &conduit_config::Config, n_http_workers: usize) -> DispatchBundle {
+    let primary = build_dispatch_swap(cfg);
+    let http_workers: Vec<DispatchSwap> = (0..n_http_workers)
+        .map(|_| build_dispatch_swap(cfg))
+        .collect();
+    DispatchBundle {
+        primary,
+        http_workers: http_workers.into(),
+    }
 }
 
 /// Active health checks. Spawn a dedicated thread + tokio runtime so
